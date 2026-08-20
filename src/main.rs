@@ -4,12 +4,14 @@ mod model;
 mod output;
 mod scanner;
 mod store;
+mod threshold;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 use crate::model::{StoredSnapshotSummary, absolute_path, root_key, target_relative_path};
+use crate::threshold::GrowthThreshold;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -50,8 +52,13 @@ enum Commands {
         store: PathBuf,
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        #[arg(long, default_value_t = 0)]
-        min_bytes: u64,
+        #[arg(
+            long,
+            default_value = "0",
+            value_name = "BYTES_OR_RATE",
+            help = "minimum absolute growth or rate, for example 100M/d or 1M/s"
+        )]
+        min_bytes: String,
         #[arg(long)]
         json: bool,
     },
@@ -159,7 +166,7 @@ fn run() -> Result<()> {
             current.as_deref(),
             &store,
             limit,
-            min_bytes,
+            &min_bytes,
             json,
         ),
         Commands::Children {
@@ -230,7 +237,7 @@ fn run_delta(
     current_path: Option<&Path>,
     store_path: &Path,
     limit: usize,
-    minimum_bytes: u64,
+    minimum_threshold: &str,
     json: bool,
 ) -> Result<()> {
     let store = store::SnapshotStore::new(absolute_path(store_path)?);
@@ -249,6 +256,13 @@ fn run_delta(
         let (current, previous) = store.require_previous_pair(&root)?;
         (current, previous)
     };
+    let threshold = GrowthThreshold::parse(minimum_threshold)
+        .map_err(|error| anyhow::anyhow!("无法解析 --min-bytes `{minimum_threshold}`：{error}"))?;
+    let elapsed_ms = current
+        .snapshot
+        .captured_at_unix_ms
+        .saturating_sub(previous.snapshot.captured_at_unix_ms);
+    let minimum_bytes = threshold.effective_bytes(elapsed_ms);
     let report = delta::compare(&current.snapshot, &previous.snapshot, limit, minimum_bytes)?;
     output::print_delta(&report, json)
 }

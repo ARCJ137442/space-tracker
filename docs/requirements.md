@@ -72,10 +72,10 @@ Space Tracker 是一个面向 Windows、优先服务 Agent 的 CLI 磁盘空间�
 space_tracker.exe
   扫描路径             [默认 C:\]
   数据存放路径         [默认 exe 所在目录]
-  增长提示阈值         [默认 100M]
+  增长提示阈值         [默认 100M；也可输入 100M/d、1M/s]
 ```
 
-交互模式先对目标目录做一次不跟随链接的轻量条目统计，建立进度分母；正式扫描时动态显示百分比和已处理条目数。结束后先显示当前占用重点路径，最后固定输出增长提醒。增长提醒只保留超过阈值且没有更深层超阈值子目录覆盖的目录，避免同一份增长在父子路径重复出现；提醒包含两次扫描之间的时间段和增长字节数，按变化量从小到大呈现。阈值支持 `B`、`K`、`M`、`G`、`T` 等二进制单位后缀。
+交互模式先对目标目录做一次不跟随链接的轻量条目统计，建立进度分母；正式扫描时动态显示百分比和已处理条目数。结束后先显示当前占用重点路径，最后固定输出增长提醒。增长提醒只保留超过阈值且没有更深层超阈值子目录覆盖的目录，避免同一份增长在父子路径重复出现；提醒包含两次扫描之间的时间段和增长字节数，按变化量从小到大呈现。阈值支持 `B`、`K`、`M`、`G`、`T` 等二进制单位后缀，也支持 `100M/d`、`1M/s` 等速度值；速度阈值会使用两次扫描的时间间隔换算为本次绝对阈值。
 
 有参数时继续使用以下 CLI：
 
@@ -83,7 +83,7 @@ space_tracker.exe
 space_tracker scan <ROOT> [--store <DIR>] [--compact] [--json]
 space_tracker history [--root <ROOT>] [--store <DIR>] [--json]
 space_tracker delta [--root <ROOT>] [--current <SNAPSHOT>] [--store <DIR>]
-                     [--limit <N>] [--min-bytes <N>] [--json]
+                     [--limit <N>] [--min-bytes <BYTES_OR_RATE>] [--json]
 space_tracker children [--root <ROOT>] [--snapshot <SNAPSHOT>]
                        --path <PATH> [--store <DIR>] [--limit <N>] [--json]
 space_tracker query [--root <ROOT>] [--snapshot <SNAPSHOT>]

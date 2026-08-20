@@ -8,8 +8,9 @@ use crate::model::{DeltaItem, DeltaReport, EntryKind, Snapshot, absolute_path};
 use crate::output;
 use crate::scanner::{self, ScanProgress};
 use crate::store::SnapshotStore;
+use crate::threshold::GrowthThreshold;
 
-const DEFAULT_GROWTH_THRESHOLD: u64 = 100 * 1024 * 1024;
+const DEFAULT_GROWTH_THRESHOLD: GrowthThreshold = GrowthThreshold::Absolute(100 * 1024 * 1024);
 const ATTENTION_LIMIT: usize = 12;
 
 pub fn pause_before_exit() {
@@ -106,7 +107,10 @@ pub fn run() -> Result<()> {
     println!();
     println!("扫描路径：{}", root.display());
     println!("数据存放：{}", store_path.display());
-    println!("增长提醒：大于 {} 的目录", output::format_bytes(threshold));
+    println!(
+        "增长提醒：大于 {} 的目录",
+        format_threshold_for_prompt(threshold)
+    );
     println!("正在建立进度基线……");
     let estimate_started = Instant::now();
     let estimate = scanner::estimate(&root)?;
@@ -137,38 +141,6 @@ pub fn run() -> Result<()> {
     println!();
     print_result(&snapshot, &saved_path, &store, threshold)?;
     Ok(())
-}
-
-pub fn parse_size_arg(value: &str) -> Result<u64, String> {
-    let value = value.trim().replace(',', "");
-    if value.is_empty() {
-        return Err("大小不能为空".to_string());
-    }
-
-    let split_at = value
-        .find(|character: char| !(character.is_ascii_digit() || character == '.'))
-        .unwrap_or(value.len());
-    let (number_text, suffix) = value.split_at(split_at);
-    let number = number_text
-        .parse::<f64>()
-        .map_err(|_| format!("无法识别大小：{value}"))?;
-    if !number.is_finite() || number < 0.0 {
-        return Err(format!("大小必须是非负数字：{value}"));
-    }
-
-    let multiplier = match suffix.to_ascii_lowercase().as_str() {
-        "" | "b" => 1_f64,
-        "k" | "kb" | "kib" => 1024_f64,
-        "m" | "mb" | "mib" => 1024_f64.powi(2),
-        "g" | "gb" | "gib" => 1024_f64.powi(3),
-        "t" | "tb" | "tib" => 1024_f64.powi(4),
-        _ => return Err(format!("不支持的大小单位：{suffix}")),
-    };
-    let bytes = number * multiplier;
-    if bytes > u64::MAX as f64 {
-        return Err(format!("大小超出范围：{value}"));
-    }
-    Ok(bytes.round() as u64)
 }
 
 fn default_store_path() -> Result<PathBuf> {
@@ -202,14 +174,14 @@ fn prompt_store_directory(label: &str, default: &Path) -> Result<PathBuf> {
     }
 }
 
-fn prompt_threshold(default: u64) -> Result<u64> {
+fn prompt_threshold(default: GrowthThreshold) -> Result<GrowthThreshold> {
     loop {
         let value = prompt(
-            "增长提示阈值（例如 100M、1G）",
-            &format_bytes_for_prompt(default),
+            "增长提示阈值（例如 100M、1G、100M/d、1M/s）",
+            &format_threshold_for_prompt(default),
         )?;
-        match parse_size_arg(&value) {
-            Ok(bytes) => return Ok(bytes),
+        match GrowthThreshold::parse(&value) {
+            Ok(threshold) => return Ok(threshold),
             Err(error) => eprintln!("{}，请重新输入。", error),
         }
     }
@@ -260,7 +232,7 @@ fn print_result(
     snapshot: &Snapshot,
     saved_path: &Path,
     store: &SnapshotStore,
-    threshold: u64,
+    threshold: GrowthThreshold,
 ) -> Result<()> {
     println!("扫描完成：{}", snapshot.root);
     output::print_summary(snapshot);
@@ -268,12 +240,19 @@ fn print_result(
     println!("snapshot: {}", saved_path.display());
 
     let report = if let Some(previous) = store.previous_for(snapshot)? {
-        Some(delta::compare(
-            snapshot,
-            &previous.snapshot,
-            usize::MAX,
-            threshold.saturating_add(1),
-        )?)
+        let elapsed_ms = snapshot
+            .captured_at_unix_ms
+            .saturating_sub(previous.snapshot.captured_at_unix_ms);
+        let effective_threshold = threshold.effective_bytes(elapsed_ms);
+        Some((
+            delta::compare(
+                snapshot,
+                &previous.snapshot,
+                usize::MAX,
+                effective_threshold.saturating_add(1),
+            )?,
+            effective_threshold,
+        ))
     } else {
         None
     };
@@ -287,7 +266,9 @@ fn print_result(
         );
     }
     match report {
-        Some(report) => print_growth_alerts(snapshot, &report, threshold),
+        Some((report, effective_threshold)) => {
+            print_growth_alerts(snapshot, &report, threshold, effective_threshold)
+        }
         None => {
             println!();
             println!("增长提醒：这是该路径的第一次扫描；再次扫描后将显示超过阈值的增长目录。",);
@@ -296,12 +277,17 @@ fn print_result(
     Ok(())
 }
 
-fn print_growth_alerts(snapshot: &Snapshot, report: &DeltaReport, threshold: u64) {
+fn print_growth_alerts(
+    snapshot: &Snapshot,
+    report: &DeltaReport,
+    threshold: GrowthThreshold,
+    effective_threshold: u64,
+) {
     println!();
     println!(
-        "增长提醒（过去 {}，阈值 > {}）：",
+        "增长提醒（过去 {}，{}）：",
         format_duration(report.elapsed_ms),
-        output::format_bytes(threshold)
+        format_threshold_description(threshold, effective_threshold)
     );
     let mut alerts = focus_growth_alerts(&report.growing_directories)
         .into_iter()
@@ -422,6 +408,37 @@ fn format_bytes_for_prompt(bytes: u64) -> String {
     }
 }
 
+fn format_threshold_for_prompt(threshold: GrowthThreshold) -> String {
+    match threshold {
+        GrowthThreshold::Absolute(bytes) => format_bytes_for_prompt(bytes),
+        GrowthThreshold::Rate {
+            bytes_per_unit,
+            unit,
+        } => format!(
+            "{}/{}",
+            format_bytes_for_prompt(bytes_per_unit),
+            unit.suffix()
+        ),
+    }
+}
+
+fn format_threshold_description(threshold: GrowthThreshold, effective_bytes: u64) -> String {
+    match threshold {
+        GrowthThreshold::Absolute(_) => {
+            format!("阈值 > {}", output::format_bytes(effective_bytes))
+        }
+        GrowthThreshold::Rate {
+            bytes_per_unit,
+            unit,
+        } => format!(
+            "速度阈值 > {}/{}，本次等效阈值 > {}",
+            output::format_bytes(bytes_per_unit),
+            unit.suffix(),
+            output::format_bytes(effective_bytes)
+        ),
+    }
+}
+
 fn shorten(value: &str, max_chars: usize) -> String {
     let chars = value.chars().collect::<Vec<_>>();
     if chars.len() <= max_chars {
@@ -435,14 +452,21 @@ fn shorten(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{focus_growth_alerts, is_actionable_path, parse_size_arg};
+    use super::{focus_growth_alerts, format_threshold_for_prompt, is_actionable_path};
     use crate::model::DeltaItem;
+    use crate::threshold::{GrowthThreshold, parse_size_bytes};
 
     #[test]
     fn parses_human_size_suffixes() {
-        assert_eq!(parse_size_arg("100M"), Ok(100 * 1024 * 1024));
-        assert_eq!(parse_size_arg("1.5GiB"), Ok(1_610_612_736));
-        assert_eq!(parse_size_arg("42"), Ok(42));
+        assert_eq!(parse_size_bytes("100M"), Ok(100 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("1.5GiB"), Ok(1_610_612_736));
+        assert_eq!(parse_size_bytes("42"), Ok(42));
+    }
+
+    #[test]
+    fn formats_rate_threshold_for_prompt() {
+        let threshold = GrowthThreshold::parse("100M/d").expect("parse rate threshold");
+        assert_eq!(format_threshold_for_prompt(threshold), "100M/d");
     }
 
     #[test]

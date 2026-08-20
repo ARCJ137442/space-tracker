@@ -21,7 +21,7 @@ Space Tracker 围绕这个用户叙事设计：
 - 无参数启动：简单的交互式 CMD 向导。
 - 扫描过程中动态显示耗时、文件数、目录数、累计大小、联接点和错误数。
 - 交互模式默认扫描 `C:\`，默认把数据放在 exe 所在目录。
-- 增长提醒阈值默认 `100M`，支持 `100M`、`1G` 或字节数。
+- 增长提醒阈值默认 `100M`，支持 `100M`、`1G`、字节数，以及按速度设置的 `100M/d`（平均每天增长 100M）、`1M/s`（平均每秒增长 1M）。
 - 扫描进度先建立条目基线并显示百分比；增长提醒按变化量从小到大呈现，并隐藏已被超阈值子目录覆盖的父目录。
 - 交互式结果先展示当前占用重点路径，最后固定输出增长提醒。
 - 无参模式结束后提示“按任意键退出”，适合直接双击 exe 使用；带参数调用不暂停。
@@ -53,7 +53,7 @@ cargo build --release
 ```text
 扫描路径             [默认 C:\]
 数据存放路径         [默认 exe 所在目录]
-增长提示阈值         [默认 100M]
+增长提示阈值         [默认 100M；也可输入 100M/d、1M/s]
 ```
 
 直接回车接受默认值。程序会在数据存放路径下创建 `space-tracker` 子目录，再按扫描根目录分开保存快照。第二次扫描同一路径后，程序会显示两次快照之间的时间段、超过阈值的增长目录和增长大小。
@@ -71,7 +71,7 @@ $root = "C:\Users\YourName\AppData"
 
 & $tool scan $root --store $store --compact --json
 & $tool history --root $root --store $store --json
-& $tool delta --root $root --store $store --min-bytes 104857600 --json
+& $tool delta --root $root --store $store --min-bytes 100M/d --json
 & $tool children --root $root --path . --store $store --json
 & $tool query --root $root --path AppData --store $store --limit 50 --json
 & $tool links --root $root --store $store --json
@@ -81,7 +81,7 @@ $root = "C:\Users\YourName\AppData"
 
 - `scan`：扫描并保存压缩快照；默认不跟随 Reparse Point。`--compact` 保留用于兼容旧调用，新格式始终使用 zstd 压缩。
 - `history`：只读取 manifest 摘要，列出同一存储目录中的历史快照。
-- `delta`：比较同一根目录的两次快照，输出增长/缩小目录、新增文件和删除文件。
+- `delta`：比较同一根目录的两次快照，输出增长/缩小目录、新增文件和删除文件；`--min-bytes` 支持绝对大小，也支持 `大小/时间单位` 形式，按两次快照的间隔换算本次实际阈值。
 - `children`：查看指定目录的直接子目录和文件。
 - `query`：面向 `.base.zst`/`.delta.zst` 的显式查询入口，按路径列出直接子项；`children` 继续作为兼容命令保留。
 - `links`：列出识别到的 Reparse Point、目标路径和未跟随状态。
