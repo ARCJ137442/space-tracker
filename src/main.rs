@@ -9,9 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use crate::model::{
-    SnapshotSummary, StoredSnapshotSummary, absolute_path, root_key, target_relative_path,
-};
+use crate::model::{StoredSnapshotSummary, absolute_path, root_key, target_relative_path};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -58,6 +56,20 @@ enum Commands {
         json: bool,
     },
     Children {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, default_value = ".space-tracker")]
+        store: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    Query {
         #[arg(long)]
         root: Option<PathBuf>,
         #[arg(long)]
@@ -135,6 +147,21 @@ fn run() -> Result<()> {
             limit,
             json,
         ),
+        Commands::Query {
+            root,
+            snapshot,
+            path,
+            store,
+            limit,
+            json,
+        } => run_children(
+            root.as_deref(),
+            snapshot.as_deref(),
+            &path,
+            &store,
+            limit,
+            json,
+        ),
         Commands::Links {
             root,
             snapshot,
@@ -157,18 +184,14 @@ fn run_history(root: Option<&Path>, store_path: &Path, json: bool) -> Result<()>
         .map(|path| absolute_path(path).map(|path| root_key(&path)))
         .transpose()?;
     let items = store
-        .list()?
+        .list_summaries()?
         .into_iter()
         .filter(|item| {
             root_key_filter
                 .as_deref()
-                .is_none_or(|key| key == item.snapshot.root_key)
+                .is_none_or(|key| key == root_key(Path::new(&item.summary.root)))
         })
-        .map(|item| StoredSnapshotSummary {
-            snapshot_path: item.path.to_string_lossy().to_string(),
-            summary: SnapshotSummary::from_snapshot(&item.snapshot),
-        })
-        .collect::<Vec<_>>();
+        .collect::<Vec<StoredSnapshotSummary>>();
     output::print_history(&items, json)
 }
 

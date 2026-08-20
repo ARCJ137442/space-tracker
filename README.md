@@ -20,9 +20,10 @@ Space Tracker 围绕这个用户叙事设计：
 
 - 无参数启动：简单的交互式 CMD 向导。
 - 扫描过程中动态显示耗时、文件数、目录数、累计大小、联接点和错误数。
-- 交互模式默认扫描 `C:\`，默认把快照放在 exe 所在目录。
+- 交互模式默认扫描 `C:\`，默认把数据放在 exe 所在目录。
 - 增长提醒阈值默认 `100M`，支持 `100M`、`1G` 或字节数。
-- 增长提醒按变化量从小到大呈现；当前占用重点路径按占用大小从大到小呈现。
+- 扫描进度先建立条目基线并显示百分比；增长提醒按变化量从小到大呈现，并隐藏已被超阈值子目录覆盖的父目录。
+- 交互式结果先展示当前占用重点路径，最后固定输出增长提醒。
 - 识别符号链接、目录联接点等 Windows Reparse Point，默认不跟随，避免重复计数。
 - 有参模式提供稳定的 CLI 和 JSON 输出，便于 Agent、脚本和自动化任务调用。
 - 只读设计：不删除、不移动、不创建符号链接。
@@ -35,14 +36,14 @@ Space Tracker 围绕这个用户叙事设计：
 cargo build --release
 ```
 
-可执行文件位于 `target\release\space_tracker.exe`。
+可执行文件位于 `target\release\space_tracker.exe`。压缩快照使用 Rust 的 zstd crate；它不要求安装 .NET Desktop Runtime。
 
 ## 人类使用
 
 直接运行：
 
 ```powershell
-.	arget\release\space_tracker.exe
+.\target\release\space_tracker.exe
 ```
 
 依次输入：
@@ -53,7 +54,7 @@ cargo build --release
 增长提示阈值         [默认 100M]
 ```
 
-直接回车接受默认值。第二次扫描同一路径后，程序会显示两次快照之间的时间段、超过阈值的增长目录和增长大小。
+直接回车接受默认值。程序会在数据存放路径下创建 `space-tracker` 子目录，再按扫描根目录分开保存快照。第二次扫描同一路径后，程序会显示两次快照之间的时间段、超过阈值的增长目录和增长大小。
 
 ## Agent / CLI 使用
 
@@ -68,17 +69,35 @@ $root = "C:\Users\YourName\AppData"
 & $tool history --root $root --store $store --json
 & $tool delta --root $root --store $store --min-bytes 104857600 --json
 & $tool children --root $root --path . --store $store --json
+& $tool query --root $root --path AppData --store $store --limit 50 --json
 & $tool links --root $root --store $store --json
 ```
 
 命令说明：
 
-- `scan`：扫描并保存 JSON 快照；默认不跟随 Reparse Point。
-- `scan --compact`：使用紧凑 JSON，适合大盘扫描。
-- `history`：列出同一存储目录中的历史快照。
+- `scan`：扫描并保存压缩快照；默认不跟随 Reparse Point。`--compact` 保留用于兼容旧调用，新格式始终使用 zstd 压缩。
+- `history`：只读取 manifest 摘要，列出同一存储目录中的历史快照。
 - `delta`：比较同一根目录的两次快照，输出增长/缩小目录、新增文件和删除文件。
 - `children`：查看指定目录的直接子目录和文件。
+- `query`：面向 `.base.zst`/`.delta.zst` 的显式查询入口，按路径列出直接子项；`children` 继续作为兼容命令保留。
 - `links`：列出识别到的 Reparse Point、目标路径和未跟随状态。
+
+## 快照存储格式
+
+指定 `--store D:\space-tracker-data` 后，实际数据位于：
+
+```text
+D:\space-tracker-data\space-tracker\<root-fingerprint>\
+├── manifest.json
+├── snapshot-<time>.base.zst
+└── snapshot-<time>.delta.zst
+```
+
+同一根目录的第一次扫描写一个完整 `.base.zst`；后续扫描只保存新增、删除和发生字段变化的条目到 `.delta.zst`。查询时按基线叠加增量恢复目标时刻的逻辑快照。基线和增量载荷沿用 Rust 当前 `Snapshot`/`Entry` 数据结构，只是使用 zstd 压缩；这样可以先消除重复完整快照的磁盘开销，并为后续索引化二进制载荷保留兼容边界。
+
+为避免长期运行后增量链无限变长，连续 32 个 delta 后下一次扫描会自动建立新的 base；旧文件不会被自动删除。
+
+旧版 `.json` 快照仍可读取。若存储目录中只有旧格式，下一次新扫描会建立新的 `.base.zst`，不会删除旧 JSON。
 
 ## 隐私与快照
 
@@ -92,6 +111,7 @@ $root = "C:\Users\YourName\AppData"
 
 - [`docs/requirements.md`](docs/requirements.md)：需求、用户叙事和验收标准
 - [`docs/design.md`](docs/design.md)：模块边界、扫描算法和快照模型
+- [`docs/storage-format.md`](docs/storage-format.md)：存储格式候选比较、选择依据和演进路线
 - [`docs/performance.md`](docs/performance.md)：匿名化性能测试与优化记录
 - [`docs/validation.md`](docs/validation.md)：自动化、夹具和真实目录验证方法
 - [`docs/privacy.md`](docs/privacy.md)：快照隐私边界和公开仓库注意事项

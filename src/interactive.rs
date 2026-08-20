@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::delta;
-use crate::model::{DeltaReport, EntryKind, Snapshot, absolute_path};
+use crate::model::{DeltaItem, DeltaReport, EntryKind, Snapshot, absolute_path};
 use crate::output;
 use crate::scanner::{self, ScanProgress};
 use crate::store::SnapshotStore;
@@ -25,9 +26,29 @@ pub fn run() -> Result<()> {
     println!("扫描路径：{}", root.display());
     println!("数据存放：{}", store_path.display());
     println!("增长提醒：大于 {} 的目录", output::format_bytes(threshold));
+    println!("正在建立进度基线……");
+    let estimate_started = Instant::now();
+    let estimate = scanner::estimate(&root)?;
+    println!(
+        "进度基线：{} 个条目（{} 个文件，{} 个目录），逻辑大小约 {}，耗时 {}",
+        estimate.total_entries,
+        estimate.file_count,
+        estimate.directory_count,
+        output::format_bytes(estimate.total_bytes),
+        format_duration(estimate_started.elapsed().as_millis().min(u64::MAX as u128) as u64,),
+    );
+    if estimate.error_count > 0 {
+        println!(
+            "进度基线有 {} 个路径无法读取，最终结果以正式扫描为准。",
+            estimate.error_count
+        );
+    }
     println!("开始扫描……");
 
-    let mut snapshot = scanner::scan_with_progress(&root, render_progress)?;
+    let total_entries = estimate.total_entries;
+    let mut snapshot = scanner::scan_with_progress(&root, move |progress| {
+        render_progress(progress, total_entries)
+    })?;
     println!();
     println!("正在保存快照……");
     let store = SnapshotStore::new(absolute_path(&store_path)?);
@@ -130,10 +151,19 @@ fn prompt(label: &str, default: &str) -> Result<String> {
     Ok(value.trim_matches(['"', '\'']).to_string())
 }
 
-fn render_progress(progress: ScanProgress) {
+fn render_progress(progress: ScanProgress, total_entries: u64) {
     let current = shorten(&progress.current_path, 86);
+    let processed_entries = progress.file_count.saturating_add(progress.directory_count);
+    let percent = if total_entries == 0 {
+        100.0
+    } else {
+        (processed_entries as f64 * 100.0 / total_entries as f64).min(100.0)
+    };
     print!(
-        "\r扫描中 | 用时 {:>8} | 文件 {:>8} | 目录 {:>7} | 数据 {:>10} | 联接 {:>4} | 错误 {:>4} | {}",
+        "\r扫描中 | {:>6.2}% ({:>8}/{:<8}) | 用时 {:>8} | 文件 {:>8} | 目录 {:>7} | 数据 {:>10} | 联接 {:>4} | 错误 {:>4} | {}",
+        percent,
+        processed_entries,
+        total_entries,
         format_duration(progress.elapsed_ms),
         progress.file_count,
         progress.directory_count,
@@ -156,22 +186,16 @@ fn print_result(
     println!("duration: {} ms", snapshot.duration_ms);
     println!("snapshot: {}", saved_path.display());
 
-    let previous = store.previous_for(snapshot)?;
-    match previous {
-        Some(previous) => {
-            let report = delta::compare(
-                snapshot,
-                &previous.snapshot,
-                ATTENTION_LIMIT,
-                threshold.saturating_add(1),
-            )?;
-            print_growth_alerts(snapshot, &report, threshold);
-        }
-        None => {
-            println!();
-            println!("增长提醒：这是该路径的第一次扫描；再次扫描后将显示超过阈值的增长目录。",);
-        }
-    }
+    let report = if let Some(previous) = store.previous_for(snapshot)? {
+        Some(delta::compare(
+            snapshot,
+            &previous.snapshot,
+            usize::MAX,
+            threshold.saturating_add(1),
+        )?)
+    } else {
+        None
+    };
 
     print_attention_paths(snapshot);
     if !snapshot.errors.is_empty() {
@@ -180,6 +204,13 @@ fn print_result(
             "注意：有 {} 个路径读取失败，详情已写入快照。",
             snapshot.errors.len()
         );
+    }
+    match report {
+        Some(report) => print_growth_alerts(snapshot, &report, threshold),
+        None => {
+            println!();
+            println!("增长提醒：这是该路径的第一次扫描；再次扫描后将显示超过阈值的增长目录。",);
+        }
     }
     Ok(())
 }
@@ -191,21 +222,20 @@ fn print_growth_alerts(snapshot: &Snapshot, report: &DeltaReport, threshold: u64
         format_duration(report.elapsed_ms),
         output::format_bytes(threshold)
     );
-    let alerts = report
-        .growing_directories
-        .iter()
-        .filter(|item| !item.relative_path.is_empty() && is_actionable_path(&item.relative_path))
+    let mut alerts = focus_growth_alerts(&report.growing_directories)
+        .into_iter()
+        .filter(|item| is_actionable_path(&item.relative_path))
         .collect::<Vec<_>>();
     if alerts.is_empty() {
         println!("  没有发现超过阈值的可关注目录（系统目录已隐藏）。");
         return;
     }
-    let mut alerts = alerts;
     alerts.sort_by(|left, right| {
         left.delta_bytes
             .cmp(&right.delta_bytes)
             .then_with(|| left.relative_path.cmp(&right.relative_path))
     });
+    alerts.truncate(ATTENTION_LIMIT);
     for item in alerts {
         println!(
             "  +{:>10} | 当前 {:>10} | {}",
@@ -214,6 +244,24 @@ fn print_growth_alerts(snapshot: &Snapshot, report: &DeltaReport, threshold: u64
             display_path(snapshot, &item.relative_path)
         );
     }
+}
+
+fn focus_growth_alerts(items: &[DeltaItem]) -> Vec<&DeltaItem> {
+    items
+        .iter()
+        .filter(|item| {
+            !item.relative_path.is_empty()
+                && !items.iter().any(|candidate| {
+                    candidate.relative_path != item.relative_path
+                        && is_descendant_path(&candidate.relative_path, &item.relative_path)
+                })
+        })
+        .collect()
+}
+
+fn is_descendant_path(path: &str, ancestor: &str) -> bool {
+    path.strip_prefix(ancestor)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn print_attention_paths(snapshot: &Snapshot) {
@@ -306,7 +354,8 @@ fn shorten(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_actionable_path, parse_size_arg};
+    use super::{focus_growth_alerts, is_actionable_path, parse_size_arg};
+    use crate::model::DeltaItem;
 
     #[test]
     fn parses_human_size_suffixes() {
@@ -321,5 +370,44 @@ mod tests {
         assert!(!is_actionable_path("Program Files/Tool"));
         assert!(is_actionable_path("Users/alice/AppData"));
         assert!(is_actionable_path("ProgramData/cache"));
+    }
+
+    #[test]
+    fn focuses_on_deepest_growth_directories() {
+        let items = vec![
+            delta_item("Users", 400),
+            delta_item("Users/alice", 300),
+            delta_item("Users/alice/AppData", 200),
+            delta_item("ProgramData", 180),
+            delta_item("Users/alice2", 70),
+        ];
+        let focused = focus_growth_alerts(&items)
+            .into_iter()
+            .map(|item| item.relative_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(focused.contains(&"Users/alice/AppData"));
+        assert!(focused.contains(&"ProgramData"));
+        assert!(focused.contains(&"Users/alice2"));
+        assert!(!focused.contains(&"Users"));
+        assert!(!focused.contains(&"Users/alice"));
+    }
+
+    #[test]
+    fn path_prefix_without_separator_is_not_a_descendant() {
+        let items = vec![delta_item("cache", 200), delta_item("cache-old", 150)];
+        let focused = focus_growth_alerts(&items);
+        assert_eq!(focused.len(), 2);
+    }
+
+    fn delta_item(relative_path: &str, delta_bytes: i64) -> DeltaItem {
+        DeltaItem {
+            relative_path: relative_path.to_string(),
+            current_bytes: delta_bytes.max(0) as u64,
+            previous_bytes: 0,
+            delta_bytes,
+            delta_percent: None,
+            growth_per_day_bytes: None,
+        }
     }
 }

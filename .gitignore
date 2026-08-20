@@ -1,5 +1,9 @@
 # Rust build output
 /target/
+/space-tracker/
+/.space-tracker/
+/*.base.zst
+/*.delta.zst
 
 # Local snapshots and validation data
 /.c-drive-*-store/

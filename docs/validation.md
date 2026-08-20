@@ -16,8 +16,10 @@ cargo build --release                              通过
 - Windows 路径大小写和尾部分隔符规范化；
 - 嵌套目录增长和增长速度计算；
 - Windows 目录联接点识别、目标不重复计数和目标路径记录；
-- 紧凑快照的流式保存与读取；
+- `.base.zst` 基线、`.delta.zst` 增量的保存、恢复和旧 JSON 兼容读取；
+- manifest 历史摘要、`query` 查询入口和增量链恢复；
 - 交互模式的大小阈值解析和系统目录过滤。
+- 交互模式的增长目录去重、结果顺序和百分比进度基线。
 
 ## 可控夹具验证
 
@@ -32,6 +34,7 @@ $store = ".\fixtures\snapshots"
 # 修改夹具后再次执行
 & $tool scan $root --store $store --compact --json
 & $tool delta --root $root --store $store --min-bytes 1 --json
+& $tool query --root $root --path . --store $store --json
 ```
 
 预期结果：
@@ -50,7 +53,7 @@ $input = ".\fixtures\fixture-root`n.\fixtures\snapshots`n100M`n"
 $input | & $tool
 ```
 
-第二次扫描同一路径后，程序应显示两次快照之间的持续时间，并只提醒增长量严格大于阈值的目录；增长提醒按变化量从小到大展示。
+第二次扫描同一路径后，程序应先显示当前占用路径，最后显示两次扫描之间的持续时间和增长提醒；增长提醒只保留增长树最深层的超阈值目录，并按变化量从小到大展示。
 
 ## 全盘参考验证
 

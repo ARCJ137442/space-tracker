@@ -61,7 +61,7 @@ Space Tracker 是一个面向 Windows、优先服务 Agent 的 CLI 磁盘空间�
 - 自动创建符号链接或目录联接点。
 - 常驻后台服务、定时任务和系统通知。
 - GUI、Treemap 和图形化报表。
-- SQLite 或其他数据库；第一版使用 JSON 快照，便于检查和备份。
+- 常驻数据库服务；第一阶段使用 zstd 压缩的 `.base.zst`/`.delta.zst` 文件，便于本地备份和增量保存。
 - 并行扫描优化；先保证结果正确，再按真实扫描耗时优化。
 
 ## 5. CLI 草案
@@ -75,7 +75,7 @@ space_tracker.exe
   增长提示阈值         [默认 100M]
 ```
 
-交互模式动态显示扫描进度，结束后显示当前占用重点路径，并只提醒超过阈值的增长目录；增长提醒包含两次扫描之间的时间段和增长字节数，按变化量从小到大呈现。阈值支持 `B`、`K`、`M`、`G`、`T` 等二进制单位后缀。
+交互模式先对目标目录做一次不跟随链接的轻量条目统计，建立进度分母；正式扫描时动态显示百分比和已处理条目数。结束后先显示当前占用重点路径，最后固定输出增长提醒。增长提醒只保留超过阈值且没有更深层超阈值子目录覆盖的目录，避免同一份增长在父子路径重复出现；提醒包含两次扫描之间的时间段和增长字节数，按变化量从小到大呈现。阈值支持 `B`、`K`、`M`、`G`、`T` 等二进制单位后缀。
 
 有参数时继续使用以下 CLI：
 
@@ -86,6 +86,8 @@ space_tracker delta [--root <ROOT>] [--current <SNAPSHOT>] [--store <DIR>]
                      [--limit <N>] [--min-bytes <N>] [--json]
 space_tracker children [--root <ROOT>] [--snapshot <SNAPSHOT>]
                        --path <PATH> [--store <DIR>] [--limit <N>] [--json]
+space_tracker query [--root <ROOT>] [--snapshot <SNAPSHOT>]
+                    --path <PATH> [--store <DIR>] [--limit <N>] [--json]
 space_tracker links [--root <ROOT>] [--snapshot <SNAPSHOT>]
                     [--store <DIR>] [--json]
 ```
@@ -103,12 +105,15 @@ space_tracker delta --root C:\Users\YourName\AppData --store D:\space-tracker\sn
 
 - 对一个小型测试目录扫描后，根目录总大小等于普通文件大小之和。
 - `children` 只返回指定目录的直接子项，并按大小排序。
-- 快照 JSON 可以独立读取，不依赖运行中的程序。
+- `.base.zst` 可以独立恢复完整快照；`.delta.zst` 可以依赖同一根目录的 manifest 和前置基线恢复逻辑快照，不依赖运行中的扫描程序。
+- 指定数据目录后，程序会创建 `space-tracker` 子目录；首份扫描写 `.base.zst`，后续扫描写 `.delta.zst`。
+- 交互式进度基线与正式扫描均不跟随 Reparse Point；百分比基于已处理文件和目录数，文件变化时允许最终值以实际扫描结果为准。
 
 ### B. Delta 和增长视图
 
 - 在两次扫描之间新增或扩大文件后，`delta` 能列出对应文件和所有受影响的父目录。
 - 目录 Delta 按增长字节数降序排列。
+- 交互式增长提醒隐藏已被超阈值子目录覆盖的父目录，并保留路径前缀边界正确性。
 - 同一路径但根目录不同的快照不能被错误比较。
 - 没有上一份同根目录快照时，CLI 明确提示而不是给出伪造的零增长。
 
@@ -138,8 +143,9 @@ space_tracker delta --root C:\Users\YourName\AppData --store D:\space-tracker\sn
 
 ## 7. 后续版本方向
 
-1. SQLite 快照索引和保留策略。
-2. 增长树：在 Delta 结果中交互式下钻，而非只列平铺路径。
-3. 链接目标显示、硬链接身份和重复数据的更精确归因。
-4. 安全的“迁移到其他盘 + 创建链接 + 回滚检查”工作流。
-5. 定时扫描和低空间提醒。
+1. 在不改变 `.base.zst`/`.delta.zst` 契约的前提下，增加版本化二进制载荷和目录索引。
+2. SQLite 或 redb 作为可选的高频查询索引层，并评估其额外空间和打包成本。
+3. 增长树：在 Delta 结果中交互式下钻，而非只列平铺路径。
+4. 链接目标显示、硬链接身份和重复数据的更精确归因。
+5. 安全的“迁移到其他盘 + 创建链接 + 回滚检查”工作流。
+6. 定时扫描和低空间提醒。

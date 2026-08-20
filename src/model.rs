@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     File,
@@ -16,7 +16,7 @@ pub struct ScanError {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Entry {
     pub relative_path: String,
     pub kind: EntryKind,
