@@ -1,0 +1,264 @@
+mod delta;
+mod interactive;
+mod model;
+mod output;
+mod scanner;
+mod store;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
+
+use crate::model::{
+    SnapshotSummary, StoredSnapshotSummary, absolute_path, root_key, target_relative_path,
+};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "space_tracker",
+    version,
+    about = "Read-only disk snapshots and growth analysis"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    Scan {
+        root: PathBuf,
+        #[arg(long, default_value = ".space-tracker")]
+        store: PathBuf,
+        #[arg(long, help = "write compact JSON snapshots to reduce disk usage")]
+        compact: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    History {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long, default_value = ".space-tracker")]
+        store: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Delta {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        current: Option<PathBuf>,
+        #[arg(long, default_value = ".space-tracker")]
+        store: PathBuf,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        min_bytes: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    Children {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, default_value = ".space-tracker")]
+        store: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    Links {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
+        #[arg(long, default_value = ".space-tracker")]
+        store: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn main() {
+    let result = if std::env::args_os().nth(1).is_none() {
+        interactive::run()
+    } else {
+        run()
+    };
+    if let Err(error) = result {
+        eprintln!("error: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Scan {
+            root,
+            store,
+            compact,
+            json,
+        } => run_scan(&root, &store, compact, json),
+        Commands::History { root, store, json } => run_history(root.as_deref(), &store, json),
+        Commands::Delta {
+            root,
+            current,
+            store,
+            limit,
+            min_bytes,
+            json,
+        } => run_delta(
+            root.as_deref(),
+            current.as_deref(),
+            &store,
+            limit,
+            min_bytes,
+            json,
+        ),
+        Commands::Children {
+            root,
+            snapshot,
+            path,
+            store,
+            limit,
+            json,
+        } => run_children(
+            root.as_deref(),
+            snapshot.as_deref(),
+            &path,
+            &store,
+            limit,
+            json,
+        ),
+        Commands::Links {
+            root,
+            snapshot,
+            store,
+            json,
+        } => run_links(root.as_deref(), snapshot.as_deref(), &store, json),
+    }
+}
+
+fn run_scan(root: &Path, store_path: &Path, compact: bool, json: bool) -> Result<()> {
+    let mut snapshot = scanner::scan(root)?;
+    let store = store::SnapshotStore::new(absolute_path(store_path)?);
+    let saved_path = store.save(&mut snapshot, compact)?;
+    output::print_scan(&saved_path.to_string_lossy(), &snapshot, json)
+}
+
+fn run_history(root: Option<&Path>, store_path: &Path, json: bool) -> Result<()> {
+    let store = store::SnapshotStore::new(absolute_path(store_path)?);
+    let root_key_filter = root
+        .map(|path| absolute_path(path).map(|path| root_key(&path)))
+        .transpose()?;
+    let items = store
+        .list()?
+        .into_iter()
+        .filter(|item| {
+            root_key_filter
+                .as_deref()
+                .is_none_or(|key| key == item.snapshot.root_key)
+        })
+        .map(|item| StoredSnapshotSummary {
+            snapshot_path: item.path.to_string_lossy().to_string(),
+            summary: SnapshotSummary::from_snapshot(&item.snapshot),
+        })
+        .collect::<Vec<_>>();
+    output::print_history(&items, json)
+}
+
+fn run_delta(
+    root: Option<&Path>,
+    current_path: Option<&Path>,
+    store_path: &Path,
+    limit: usize,
+    minimum_bytes: u64,
+    json: bool,
+) -> Result<()> {
+    let store = store::SnapshotStore::new(absolute_path(store_path)?);
+    let (current, previous) = if let Some(current_path) = current_path {
+        let current = store::StoredSnapshot {
+            path: current_path.to_path_buf(),
+            snapshot: store.load(current_path)?,
+        };
+        let previous = store
+            .previous_for(&current.snapshot)?
+            .context("no previous snapshot found for current snapshot")?;
+        (current, previous)
+    } else {
+        let root = root.context("provide --root or --current")?;
+        let root = absolute_path(root)?;
+        let (current, previous) = store.require_previous_pair(&root)?;
+        (current, previous)
+    };
+    let report = delta::compare(&current.snapshot, &previous.snapshot, limit, minimum_bytes)?;
+    output::print_delta(&report, json)
+}
+
+fn run_children(
+    root: Option<&Path>,
+    snapshot_path: Option<&Path>,
+    requested_path: &Path,
+    store_path: &Path,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let snapshot = load_snapshot(root, snapshot_path, store_path)?;
+    let requested_relative = target_relative_path(&snapshot, requested_path)?;
+    let mut entries = snapshot
+        .entries
+        .iter()
+        .filter(|entry| {
+            !entry.relative_path.is_empty()
+                && parent_relative(&entry.relative_path) == requested_relative
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .size_bytes
+            .cmp(&left.size_bytes)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    entries.truncate(limit);
+    output::print_entries(&entries, &snapshot.root, json)
+}
+
+fn run_links(
+    root: Option<&Path>,
+    snapshot_path: Option<&Path>,
+    store_path: &Path,
+    json: bool,
+) -> Result<()> {
+    let snapshot = load_snapshot(root, snapshot_path, store_path)?;
+    let entries = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.is_reparse_point)
+        .cloned()
+        .collect::<Vec<_>>();
+    output::print_entries(&entries, &snapshot.root, json)
+}
+
+fn load_snapshot(
+    root: Option<&Path>,
+    snapshot_path: Option<&Path>,
+    store_path: &Path,
+) -> Result<model::Snapshot> {
+    let store = store::SnapshotStore::new(absolute_path(store_path)?);
+    if let Some(snapshot_path) = snapshot_path {
+        return store.load(snapshot_path);
+    }
+    let root = root.context("provide --root or --snapshot")?;
+    Ok(store.require_latest(&absolute_path(root)?)?.snapshot)
+}
+
+fn parent_relative(path: &str) -> String {
+    path.rsplit_once('/')
+        .map_or_else(String::new, |(parent, _)| parent.to_string())
+}

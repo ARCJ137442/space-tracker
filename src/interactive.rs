@@ -1,0 +1,325 @@
+use anyhow::{Context, Result, bail};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use crate::delta;
+use crate::model::{DeltaReport, EntryKind, Snapshot, absolute_path};
+use crate::output;
+use crate::scanner::{self, ScanProgress};
+use crate::store::SnapshotStore;
+
+const DEFAULT_GROWTH_THRESHOLD: u64 = 100 * 1024 * 1024;
+const ATTENTION_LIMIT: usize = 12;
+
+pub fn run() -> Result<()> {
+    println!("space_tracker - 人类友好的磁盘空间扫描");
+    println!("直接回车使用默认值；扫描只读磁盘，不会删除或移动文件。\n");
+
+    let default_root = PathBuf::from(r"C:\");
+    let default_store = default_store_path()?;
+    let root = prompt_existing_directory("扫描路径", &default_root)?;
+    let store_path = prompt_store_directory("数据存放路径", &default_store)?;
+    let threshold = prompt_threshold(DEFAULT_GROWTH_THRESHOLD)?;
+
+    println!();
+    println!("扫描路径：{}", root.display());
+    println!("数据存放：{}", store_path.display());
+    println!("增长提醒：大于 {} 的目录", output::format_bytes(threshold));
+    println!("开始扫描……");
+
+    let mut snapshot = scanner::scan_with_progress(&root, render_progress)?;
+    println!();
+    println!("正在保存快照……");
+    let store = SnapshotStore::new(absolute_path(&store_path)?);
+    let saved_path = store.save(&mut snapshot, true)?;
+    println!();
+    print_result(&snapshot, &saved_path, &store, threshold)?;
+    Ok(())
+}
+
+pub fn parse_size_arg(value: &str) -> Result<u64, String> {
+    let value = value.trim().replace(',', "");
+    if value.is_empty() {
+        return Err("大小不能为空".to_string());
+    }
+
+    let split_at = value
+        .find(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .unwrap_or(value.len());
+    let (number_text, suffix) = value.split_at(split_at);
+    let number = number_text
+        .parse::<f64>()
+        .map_err(|_| format!("无法识别大小：{value}"))?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(format!("大小必须是非负数字：{value}"));
+    }
+
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1_f64,
+        "k" | "kb" | "kib" => 1024_f64,
+        "m" | "mb" | "mib" => 1024_f64.powi(2),
+        "g" | "gb" | "gib" => 1024_f64.powi(3),
+        "t" | "tb" | "tib" => 1024_f64.powi(4),
+        _ => return Err(format!("不支持的大小单位：{suffix}")),
+    };
+    let bytes = number * multiplier;
+    if bytes > u64::MAX as f64 {
+        return Err(format!("大小超出范围：{value}"));
+    }
+    Ok(bytes.round() as u64)
+}
+
+fn default_store_path() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("无法确定 exe 所在目录")?;
+    executable
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("无法确定 exe 所在目录"))
+}
+
+fn prompt_existing_directory(label: &str, default: &Path) -> Result<PathBuf> {
+    loop {
+        let value = prompt(label, &default.display().to_string())?;
+        let path = absolute_path(Path::new(&value))?;
+        if path.is_dir() {
+            return Ok(path);
+        }
+        eprintln!("路径不存在或不是目录，请重新输入：{}", path.display());
+    }
+}
+
+fn prompt_store_directory(label: &str, default: &Path) -> Result<PathBuf> {
+    loop {
+        let value = prompt(label, &default.display().to_string())?;
+        let path = absolute_path(Path::new(&value))?;
+        if path.exists() && !path.is_dir() {
+            eprintln!("数据存放路径已经是文件，请重新输入：{}", path.display());
+            continue;
+        }
+        return Ok(path);
+    }
+}
+
+fn prompt_threshold(default: u64) -> Result<u64> {
+    loop {
+        let value = prompt(
+            "增长提示阈值（例如 100M、1G）",
+            &format_bytes_for_prompt(default),
+        )?;
+        match parse_size_arg(&value) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => eprintln!("{}，请重新输入。", error),
+        }
+    }
+}
+
+fn prompt(label: &str, default: &str) -> Result<String> {
+    print!("{} [{}]: ", label, default);
+    io::stdout().flush().context("无法刷新命令行提示")?;
+    let mut input = String::new();
+    let read = io::stdin()
+        .read_line(&mut input)
+        .context("无法读取命令行输入")?;
+    if read == 0 {
+        bail!("输入已结束，交互式扫描取消");
+    }
+    let value = input.trim();
+    if value.is_empty() {
+        return Ok(default.to_string());
+    }
+    Ok(value.trim_matches(['"', '\'']).to_string())
+}
+
+fn render_progress(progress: ScanProgress) {
+    let current = shorten(&progress.current_path, 86);
+    print!(
+        "\r扫描中 | 用时 {:>8} | 文件 {:>8} | 目录 {:>7} | 数据 {:>10} | 联接 {:>4} | 错误 {:>4} | {}",
+        format_duration(progress.elapsed_ms),
+        progress.file_count,
+        progress.directory_count,
+        output::format_bytes(progress.total_bytes),
+        progress.reparse_point_count,
+        progress.error_count,
+        current
+    );
+    let _ = io::stdout().flush();
+}
+
+fn print_result(
+    snapshot: &Snapshot,
+    saved_path: &Path,
+    store: &SnapshotStore,
+    threshold: u64,
+) -> Result<()> {
+    println!("扫描完成：{}", snapshot.root);
+    output::print_summary(snapshot);
+    println!("duration: {} ms", snapshot.duration_ms);
+    println!("snapshot: {}", saved_path.display());
+
+    let previous = store.previous_for(snapshot)?;
+    match previous {
+        Some(previous) => {
+            let report = delta::compare(
+                snapshot,
+                &previous.snapshot,
+                ATTENTION_LIMIT,
+                threshold.saturating_add(1),
+            )?;
+            print_growth_alerts(snapshot, &report, threshold);
+        }
+        None => {
+            println!();
+            println!("增长提醒：这是该路径的第一次扫描；再次扫描后将显示超过阈值的增长目录。",);
+        }
+    }
+
+    print_attention_paths(snapshot);
+    if !snapshot.errors.is_empty() {
+        println!();
+        println!(
+            "注意：有 {} 个路径读取失败，详情已写入快照。",
+            snapshot.errors.len()
+        );
+    }
+    Ok(())
+}
+
+fn print_growth_alerts(snapshot: &Snapshot, report: &DeltaReport, threshold: u64) {
+    println!();
+    println!(
+        "增长提醒（过去 {}，阈值 > {}）：",
+        format_duration(report.elapsed_ms),
+        output::format_bytes(threshold)
+    );
+    let alerts = report
+        .growing_directories
+        .iter()
+        .filter(|item| !item.relative_path.is_empty() && is_actionable_path(&item.relative_path))
+        .collect::<Vec<_>>();
+    if alerts.is_empty() {
+        println!("  没有发现超过阈值的可关注目录（系统目录已隐藏）。");
+        return;
+    }
+    let mut alerts = alerts;
+    alerts.sort_by(|left, right| {
+        left.delta_bytes
+            .cmp(&right.delta_bytes)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    for item in alerts {
+        println!(
+            "  +{:>10} | 当前 {:>10} | {}",
+            output::format_bytes(item.delta_bytes as u64),
+            output::format_bytes(item.current_bytes),
+            display_path(snapshot, &item.relative_path)
+        );
+    }
+}
+
+fn print_attention_paths(snapshot: &Snapshot) {
+    let mut entries = snapshot
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == EntryKind::Directory
+                && !entry.relative_path.is_empty()
+                && !entry.is_reparse_point
+                && is_actionable_path(&entry.relative_path)
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .size_bytes
+            .cmp(&left.size_bytes)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    entries.truncate(ATTENTION_LIMIT);
+
+    println!();
+    println!("值得关注的当前占用路径（已隐藏 Windows/程序安装目录）：");
+    if entries.is_empty() {
+        println!("  没有可展示的目录。");
+        return;
+    }
+    for entry in entries {
+        println!(
+            "  {:>10} | {}",
+            output::format_bytes(entry.size_bytes),
+            display_path(snapshot, &entry.relative_path)
+        );
+    }
+}
+
+fn is_actionable_path(relative: &str) -> bool {
+    let first = relative.split('/').next().unwrap_or_default();
+    !matches!(
+        first.to_ascii_lowercase().as_str(),
+        "windows"
+            | "program files"
+            | "program files (x86)"
+            | "recovery"
+            | "system volume information"
+    )
+}
+
+fn display_path(snapshot: &Snapshot, relative: &str) -> String {
+    if relative.is_empty() {
+        snapshot.root.clone()
+    } else {
+        format!(
+            "{}\\{}",
+            snapshot.root.trim_end_matches(['\\', '/']),
+            relative.replace('/', "\\")
+        )
+    }
+}
+
+fn format_duration(milliseconds: u64) -> String {
+    let seconds = milliseconds as f64 / 1000.0;
+    if seconds < 60.0 {
+        return format!("{seconds:.1} 秒");
+    }
+    let total_seconds = milliseconds / 1000;
+    let minutes = total_seconds / 60;
+    let remaining = total_seconds % 60;
+    format!("{minutes} 分 {remaining} 秒")
+}
+
+fn format_bytes_for_prompt(bytes: u64) -> String {
+    if bytes.is_multiple_of(1024 * 1024) {
+        format!("{}M", bytes / (1024 * 1024))
+    } else {
+        bytes.to_string()
+    }
+}
+
+fn shorten(value: &str, max_chars: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+    let tail = chars[chars.len() - max_chars.saturating_sub(3)..]
+        .iter()
+        .collect::<String>();
+    format!("...{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_actionable_path, parse_size_arg};
+
+    #[test]
+    fn parses_human_size_suffixes() {
+        assert_eq!(parse_size_arg("100M"), Ok(100 * 1024 * 1024));
+        assert_eq!(parse_size_arg("1.5GiB"), Ok(1_610_612_736));
+        assert_eq!(parse_size_arg("42"), Ok(42));
+    }
+
+    #[test]
+    fn hides_system_roots_but_keeps_user_data() {
+        assert!(!is_actionable_path("Windows/Temp"));
+        assert!(!is_actionable_path("Program Files/Tool"));
+        assert!(is_actionable_path("Users/alice/AppData"));
+        assert!(is_actionable_path("ProgramData/cache"));
+    }
+}

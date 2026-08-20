@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+
+# Local snapshots and validation data
+/.c-drive-*-store/
+/.real-validation-store/
+/.validation-trash/
+/.interactive-validation-store/
+/.cli-compat-validation-store/
+/fixtures/
+/snapshot-*.json
+/*.json.tmp
+
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
