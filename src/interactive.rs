@@ -25,9 +25,10 @@ fn wait_for_any_key() {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
         ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, FlushConsoleInputBuffer,
-        GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE,
-        SetConsoleMode,
+        GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT, LEFT_CTRL_PRESSED,
+        RIGHT_CTRL_PRESSED, ReadConsoleInputW, STD_INPUT_HANDLE, SetConsoleMode,
     };
+    use windows_sys::Win32::System::Threading::ExitProcess;
 
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
@@ -66,10 +67,16 @@ fn wait_for_any_key() {
         }
 
         let record = unsafe { record.assume_init() };
-        if u32::from(record.EventType) == KEY_EVENT
-            && unsafe { record.Event.KeyEvent }.bKeyDown != 0
-        {
-            break;
+        if u32::from(record.EventType) == KEY_EVENT {
+            let key_event = unsafe { record.Event.KeyEvent };
+            let ctrl_pressed =
+                key_event.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0;
+            if ctrl_pressed && key_event.wVirtualKeyCode == 0x43 {
+                unsafe { ExitProcess(130) };
+            }
+            if key_event.bKeyDown != 0 {
+                break;
+            }
         }
     }
 

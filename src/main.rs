@@ -96,6 +96,7 @@ enum Commands {
 }
 
 fn main() {
+    install_ctrl_c_handler();
     let interactive_mode = std::env::args_os().nth(1).is_none();
     let result = if interactive_mode {
         interactive::run()
@@ -113,6 +114,28 @@ fn main() {
         interactive::pause_before_exit();
     }
 }
+
+#[cfg(windows)]
+fn install_ctrl_c_handler() {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+    };
+    use windows_sys::Win32::System::Threading::ExitProcess;
+
+    unsafe extern "system" fn handler(ctrl_type: u32) -> windows_sys::core::BOOL {
+        if ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT {
+            unsafe { ExitProcess(130) };
+        }
+        0
+    }
+
+    // ExitProcess is intentional here: Ctrl+C is an explicit request to
+    // cancel a potentially long-running scan immediately.
+    let _ = unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
+}
+
+#[cfg(not(windows))]
+fn install_ctrl_c_handler() {}
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
