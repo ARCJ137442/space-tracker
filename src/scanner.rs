@@ -8,6 +8,9 @@ use crate::model::{
     Entry, EntryKind, SNAPSHOT_FORMAT_VERSION, ScanError, Snapshot, absolute_path, root_key,
 };
 
+const PARALLEL_MIN_JOBS: usize = 8;
+const DEFAULT_MAX_SCAN_THREADS: usize = 8;
+
 #[derive(Clone, Debug)]
 pub struct ScanProgress {
     pub current_path: String,
@@ -65,7 +68,8 @@ pub fn estimate(root: &Path) -> Result<ScanEstimate> {
         error_count: 0,
     };
     if !root_is_reparse {
-        estimate_directory(&root, &mut estimate);
+        let thread_pool = build_scan_thread_pool()?;
+        thread_pool.install(|| estimate_directory_parallel(&root, &mut estimate));
     }
     Ok(estimate)
 }
@@ -119,7 +123,8 @@ fn scan_internal(
         let total = if state.progress.is_some() {
             scan_directory(&root, "", &mut state)
         } else {
-            scan_directory_parallel(&root, "", &mut state)
+            let thread_pool = build_scan_thread_pool()?;
+            thread_pool.install(|| scan_directory_parallel(&root, "", &mut state))
         };
         state
             .entries
@@ -191,27 +196,103 @@ fn scan_directory_parallel(path: &Path, relative: &str, state: &mut ScanState) -
         let child_relative = append_relative(relative, &child.file_name());
         jobs.push((child_path, child_relative));
     }
-    if jobs.len() < 2 {
+    if jobs.len() < PARALLEL_MIN_JOBS {
         return jobs
             .into_iter()
-            .map(|(child_path, child_relative)| scan_child(&child_path, &child_relative, state))
+            .map(|(child_path, child_relative)| {
+                scan_child_parallel(&child_path, &child_relative, state)
+            })
             .sum();
     }
 
-    let results = jobs
+    // Keep each Rayon worker's mutable scan state local, then merge the
+    // independent results. This avoids a shared lock on every filesystem
+    // entry and also keeps the number of result buffers bounded by Rayon
+    // partitions instead of by the number of files in this directory.
+    let merged = jobs
         .into_par_iter()
-        .map(|(child_path, child_relative)| {
-            let mut child_state = empty_scan_state();
-            let total_bytes = scan_child(&child_path, &child_relative, &mut child_state);
-            (child_state, total_bytes)
-        })
-        .collect::<Vec<_>>();
-    let mut total_bytes: u64 = 0;
-    for (child_state, child_total) in results {
-        merge_scan_state(state, child_state);
-        total_bytes = total_bytes.saturating_add(child_total);
-    }
+        .fold(
+            empty_scan_state,
+            |mut local_state, (child_path, child_relative)| {
+                scan_child_parallel(&child_path, &child_relative, &mut local_state);
+                local_state
+            },
+        )
+        .reduce(empty_scan_state, |mut left, right| {
+            merge_scan_state(&mut left, right);
+            left
+        });
+    let total_bytes = merged.total_bytes;
+    merge_scan_state(state, merged);
     total_bytes
+}
+
+fn scan_child_parallel(path: &Path, relative: &str, state: &mut ScanState) -> u64 {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            record_error(state, path, error);
+            return 0;
+        }
+    };
+
+    if is_reparse_point(&metadata) {
+        let target = resolve_link_target(path);
+        let kind = if is_directory_link(&metadata, target.as_deref()) {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        };
+        state.reparse_point_count += 1;
+        match kind {
+            EntryKind::Directory => state.directory_count += 1,
+            EntryKind::File => state.file_count += 1,
+        }
+        state
+            .entries
+            .push(make_entry_with_target(relative, kind, 0, &metadata, target));
+        return 0;
+    }
+
+    if metadata.is_dir() {
+        state.directory_count += 1;
+        let child_size = scan_directory_parallel(path, relative, state);
+        state.entries.push(make_entry(
+            relative,
+            EntryKind::Directory,
+            child_size,
+            &metadata,
+        ));
+        child_size
+    } else {
+        let size = metadata.len();
+        state.file_count += 1;
+        state
+            .entries
+            .push(make_entry(relative, EntryKind::File, size, &metadata));
+        state.total_bytes = state.total_bytes.saturating_add(size);
+        size
+    }
+}
+
+fn scan_thread_count() -> usize {
+    std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get())
+                .unwrap_or(1)
+                .clamp(1, DEFAULT_MAX_SCAN_THREADS)
+        })
+}
+
+fn build_scan_thread_pool() -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(scan_thread_count())
+        .build()
+        .context("failed to create scanner thread pool")
 }
 
 fn scan_child(path: &Path, relative: &str, state: &mut ScanState) -> u64 {
@@ -294,7 +375,7 @@ fn merge_scan_state(target: &mut ScanState, mut source: ScanState) {
     target.total_bytes = target.total_bytes.saturating_add(source.total_bytes);
 }
 
-fn estimate_directory(path: &Path, estimate: &mut ScanEstimate) {
+fn estimate_directory_parallel(path: &Path, estimate: &mut ScanEstimate) {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(_) => {
@@ -303,6 +384,7 @@ fn estimate_directory(path: &Path, estimate: &mut ScanEstimate) {
         }
     };
 
+    let mut jobs = Vec::new();
     for child in entries {
         let child = match child {
             Ok(child) => child,
@@ -311,33 +393,63 @@ fn estimate_directory(path: &Path, estimate: &mut ScanEstimate) {
                 continue;
             }
         };
-        let child_path = child.path();
-        let metadata = match fs::symlink_metadata(&child_path) {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                estimate.error_count = estimate.error_count.saturating_add(1);
-                continue;
-            }
-        };
+        jobs.push(child.path());
+    }
 
-        estimate.total_entries = estimate.total_entries.saturating_add(1);
-        if is_reparse_point(&metadata) {
-            let target = resolve_link_target(&child_path);
-            if is_directory_link(&metadata, target.as_deref()) {
-                estimate.directory_count = estimate.directory_count.saturating_add(1);
-            } else {
-                estimate.file_count = estimate.file_count.saturating_add(1);
-            }
-            continue;
+    if jobs.len() < PARALLEL_MIN_JOBS {
+        for child_path in jobs {
+            estimate_child(&child_path, estimate);
         }
-        if metadata.is_dir() {
+        return;
+    }
+
+    let merged = jobs
+        .into_par_iter()
+        .fold(ScanEstimate::default, |mut local, child_path| {
+            estimate_child(&child_path, &mut local);
+            local
+        })
+        .reduce(ScanEstimate::default, |mut left, right| {
+            merge_estimate(&mut left, right);
+            left
+        });
+    merge_estimate(estimate, merged);
+}
+
+fn estimate_child(path: &Path, estimate: &mut ScanEstimate) {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            estimate.error_count = estimate.error_count.saturating_add(1);
+            return;
+        }
+    };
+
+    estimate.total_entries = estimate.total_entries.saturating_add(1);
+    if is_reparse_point(&metadata) {
+        let target = resolve_link_target(path);
+        if is_directory_link(&metadata, target.as_deref()) {
             estimate.directory_count = estimate.directory_count.saturating_add(1);
-            estimate_directory(&child_path, estimate);
         } else {
             estimate.file_count = estimate.file_count.saturating_add(1);
-            estimate.total_bytes = estimate.total_bytes.saturating_add(metadata.len());
         }
+    } else if metadata.is_dir() {
+        estimate.directory_count = estimate.directory_count.saturating_add(1);
+        estimate_directory_parallel(path, estimate);
+    } else {
+        estimate.file_count = estimate.file_count.saturating_add(1);
+        estimate.total_bytes = estimate.total_bytes.saturating_add(metadata.len());
     }
+}
+
+fn merge_estimate(target: &mut ScanEstimate, source: ScanEstimate) {
+    target.total_entries = target.total_entries.saturating_add(source.total_entries);
+    target.file_count = target.file_count.saturating_add(source.file_count);
+    target.directory_count = target
+        .directory_count
+        .saturating_add(source.directory_count);
+    target.total_bytes = target.total_bytes.saturating_add(source.total_bytes);
+    target.error_count = target.error_count.saturating_add(source.error_count);
 }
 
 impl ScanState {
@@ -504,6 +616,15 @@ mod tests {
         fs::create_dir_all(root.join("nested")).expect("create nested fixture");
         fs::write(root.join("one.txt"), b"one").expect("write first file");
         fs::write(root.join("nested").join("two.txt"), b"two").expect("write second file");
+        for index in 0..12 {
+            fs::write(root.join(format!("wide-{index}.txt")), index.to_string())
+                .expect("write wide root file");
+            fs::write(
+                root.join("nested").join(format!("wide-{index}.txt")),
+                index.to_string(),
+            )
+            .expect("write wide nested file");
+        }
 
         let mut parallel = scan(&root).expect("parallel scan");
         let mut with_progress = scan_with_progress(&root, |_| {}).expect("progress scan");

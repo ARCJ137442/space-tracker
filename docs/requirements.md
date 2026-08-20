@@ -62,7 +62,7 @@ Space Tracker 是一个面向 Windows、优先服务 Agent 的 CLI 磁盘空间�
 - 常驻后台服务、定时任务和系统通知。
 - GUI、Treemap 和图形化报表。
 - 常驻数据库服务；第一阶段使用 zstd 压缩的 `.base.zst`/`.delta.zst` 文件，便于本地备份和增量保存。
-- 并行扫描优化；先保证结果正确，再按真实扫描耗时优化。
+- 无上限的并行扫描调度；并行化必须受控，并以结果一致性、内存占用和真实扫描耗时为准。
 
 ## 5. CLI 草案
 
@@ -108,6 +108,7 @@ space_tracker delta --root C:\Users\YourName\AppData --store D:\space-tracker\sn
 - `.base.zst` 可以独立恢复完整快照；`.delta.zst` 可以依赖同一根目录的 manifest 和前置基线恢复逻辑快照，不依赖运行中的扫描程序。
 - 指定数据目录后，程序会创建 `space-tracker` 子目录；首份扫描写 `.base.zst`，后续扫描写 `.delta.zst`。
 - 交互式进度基线与正式扫描均不跟随 Reparse Point；百分比基于已处理文件和目录数，文件变化时允许最终值以实际扫描结果为准。
+- 有参扫描和交互式进度基线使用受控 Rayon 并行；交互式正式扫描保留顺序回调，确保人类可读的进度输出稳定。
 
 ### B. Delta 和增长视图
 
