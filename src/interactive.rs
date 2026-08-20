@@ -12,6 +12,72 @@ use crate::store::SnapshotStore;
 const DEFAULT_GROWTH_THRESHOLD: u64 = 100 * 1024 * 1024;
 const ATTENTION_LIMIT: usize = 12;
 
+pub fn pause_before_exit() {
+    println!();
+    println!("按任意键退出……");
+    let _ = io::stdout().flush();
+    wait_for_any_key();
+}
+
+#[cfg(windows)]
+fn wait_for_any_key() {
+    use std::mem::MaybeUninit;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, GetConsoleMode, GetStdHandle,
+        INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE, SetConsoleMode,
+    };
+
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        wait_for_enter();
+        return;
+    }
+
+    let mut original_mode = 0;
+    if unsafe { GetConsoleMode(handle, &mut original_mode) } == 0 {
+        wait_for_enter();
+        return;
+    }
+
+    let raw_mode =
+        original_mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+    if unsafe { SetConsoleMode(handle, raw_mode) } == 0 {
+        wait_for_enter();
+        return;
+    }
+
+    loop {
+        let mut record = MaybeUninit::<INPUT_RECORD>::uninit();
+        let mut records_read = 0;
+        if unsafe { ReadConsoleInputW(handle, record.as_mut_ptr(), 1, &mut records_read) } == 0 {
+            break;
+        }
+        if records_read == 0 {
+            continue;
+        }
+
+        let record = unsafe { record.assume_init() };
+        if u32::from(record.EventType) == KEY_EVENT
+            && unsafe { record.Event.KeyEvent }.bKeyDown != 0
+        {
+            break;
+        }
+    }
+
+    let _ = unsafe { SetConsoleMode(handle, original_mode) };
+}
+
+#[cfg(not(windows))]
+fn wait_for_any_key() {
+    wait_for_enter();
+}
+
+fn wait_for_enter() {
+    let mut input = String::new();
+    let _ = io::stdin().read_line(&mut input);
+}
+
 pub fn run() -> Result<()> {
     println!("space_tracker - 人类友好的磁盘空间扫描");
     println!("直接回车使用默认值；扫描只读磁盘，不会删除或移动文件。\n");

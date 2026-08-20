@@ -96,14 +96,21 @@ enum Commands {
 }
 
 fn main() {
-    let result = if std::env::args_os().nth(1).is_none() {
+    let interactive_mode = std::env::args_os().nth(1).is_none();
+    let result = if interactive_mode {
         interactive::run()
     } else {
         run()
     };
     if let Err(error) = result {
         eprintln!("error: {error:#}");
+        if interactive_mode {
+            interactive::pause_before_exit();
+        }
         std::process::exit(1);
+    }
+    if interactive_mode {
+        interactive::pause_before_exit();
     }
 }
 
