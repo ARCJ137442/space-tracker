@@ -24,8 +24,9 @@ fn wait_for_any_key() {
     use std::mem::MaybeUninit;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
-        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, GetConsoleMode, GetStdHandle,
-        INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE, SetConsoleMode,
+        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, FlushConsoleInputBuffer,
+        GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE,
+        SetConsoleMode,
     };
 
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
@@ -43,6 +44,13 @@ fn wait_for_any_key() {
     let raw_mode =
         original_mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
     if unsafe { SetConsoleMode(handle, raw_mode) } == 0 {
+        wait_for_enter();
+        return;
+    }
+    // The Enter key used for the final prompt can still be queued as a
+    // console event. Discard all pre-existing events so only a new key exits.
+    if unsafe { FlushConsoleInputBuffer(handle) } == 0 {
+        let _ = unsafe { SetConsoleMode(handle, original_mode) };
         wait_for_enter();
         return;
     }
