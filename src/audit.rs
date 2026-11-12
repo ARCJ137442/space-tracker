@@ -108,6 +108,10 @@ pub fn run(snapshot: &Snapshot) -> AuditReport {
     let mut sparse_apparent_bytes = 0u64;
     let mut estimated_files = 0u64;
     let mut estimated_apparent_bytes = 0u64;
+    // Files the platform could not identify, counted once each.
+    let mut unidentified_allocated = 0u64;
+    let mut unidentified_apparent = 0u64;
+    let mut unidentified_single_link = 0u64;
     // Files grouped by size and write time, to catch the same bytes counted
     // under two different record identities.
     let mut by_shape: HashMap<(u64, Option<i64>), Vec<String>> = HashMap::new();
@@ -147,7 +151,17 @@ pub fn run(snapshot: &Snapshot) -> AuditReport {
                     slot.3.push(entry.relative_path.clone());
                 }
             }
-            None => without_identity += 1,
+            None => {
+                without_identity += 1;
+                // A file the platform could not identify is its own record:
+                // no other path can point at it, so it is counted once.
+                unidentified_allocated = unidentified_allocated.saturating_add(entry.allocated_bytes);
+                unidentified_apparent = unidentified_apparent.saturating_add(entry.size_bytes);
+                if entry.link_count <= 1 {
+                    unidentified_single_link = unidentified_single_link
+                        .saturating_add(entry.allocated_bytes);
+                }
+            }
         }
     }
 
@@ -166,6 +180,12 @@ pub fn run(snapshot: &Snapshot) -> AuditReport {
             multi_path_records += 1;
         }
     }
+
+    // The files the platform could not identify are counted once each, so
+    // the audit's allocation matches the snapshot's own total.
+    allocated_distinct = allocated_distinct.saturating_add(unidentified_allocated);
+    apparent_distinct = apparent_distinct.saturating_add(unidentified_apparent);
+    allocated_single_link = allocated_single_link.saturating_add(unidentified_single_link);
 
     // A record's path count is how many entries carry its identity.
     let mut path_counts: HashMap<FileId, u64> = HashMap::new();
