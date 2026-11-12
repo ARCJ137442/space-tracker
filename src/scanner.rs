@@ -240,7 +240,7 @@ fn scan_child_parallel(path: &Path, relative: &str, state: &mut ScanState) -> u6
         Ok(facts) => facts,
         Err(error) => {
             record_error(state, path, error);
-            return 0;
+            return listed_child(path, relative, state);
         }
     };
 
@@ -308,8 +308,9 @@ fn scan_child(path: &Path, relative: &str, state: &mut ScanState) -> u64 {
         Ok(facts) => facts,
         Err(error) => {
             record_error(state, path, error);
+            let size = listed_child(path, relative, state);
             state.report_if_due(path);
-            return 0;
+            return size;
         }
     };
 
@@ -526,6 +527,7 @@ fn make_entry(relative: &str, kind: EntryKind, size_bytes: u64, facts: &FileFact
         file_id: if is_file { facts.file_id } else { None },
         is_sparse: if is_file { facts.is_sparse } else { false },
         is_placeholder: if is_file { facts.is_placeholder } else { false },
+        allocation_estimated: false,
     }
 }
 
@@ -553,6 +555,61 @@ fn make_entry_with_target(
         file_id: None,
         is_sparse: false,
         is_placeholder: false,
+        allocation_estimated: false,
+    }
+}
+
+/// Records a file that could not be opened, using the size its directory
+/// listing reports.
+///
+/// The paging file, the hibernation file and files inside protected folders
+/// refuse to be opened by anyone. Leaving them out would hide tens of
+/// gigabytes from the measurement, so their size is taken from the listing
+/// instead. Their allocation is then an estimate: the filesystem never said
+/// how many clusters they own.
+fn listed_child(path: &Path, relative: &str, state: &mut ScanState) -> u64 {
+    let Some(listed) = fsinfo::listed(path) else {
+        return 0;
+    };
+    if listed.is_dir {
+        // A directory that cannot be opened cannot be walked either.
+        return 0;
+    }
+    state.file_count += 1;
+    let size = listed.apparent_size;
+    state.entries.push(make_listed_entry(relative, &listed));
+    state.total_bytes = state.total_bytes.saturating_add(size);
+    size
+}
+
+/// Builds the entry for a file that was measured from a directory listing.
+fn make_listed_entry(relative: &str, listed: &fsinfo::ListedFacts) -> Entry {
+    // A sparse file, a compressed file and a placeholder all own fewer
+    // clusters than their length says, and the listing does not say by how
+    // much. Guessing the length for those would overstate the volume, so
+    // they are counted as owning nothing and marked as estimates.
+    let owns_clusters =
+        !listed.is_sparse && !listed.is_compressed && !listed.is_reparse_point;
+    Entry {
+        relative_path: relative.to_string(),
+        kind: EntryKind::File,
+        size_bytes: listed.apparent_size,
+        modified_unix_ms: listed.modified_unix_ms,
+        is_reparse_point: false,
+        link_target: None,
+        followed: false,
+        allocated_bytes: if owns_clusters {
+            listed.apparent_size
+        } else {
+            0
+        },
+        reclaimable_bytes: 0,
+        shared_bytes: 0,
+        link_count: 1,
+        file_id: None,
+        is_sparse: listed.is_sparse,
+        is_placeholder: listed.is_reparse_point,
+        allocation_estimated: true,
     }
 }
 
@@ -803,6 +860,39 @@ mod tests {
         assert_eq!(snapshot.total_reclaimable_bytes, 0);
 
         fs::remove_dir_all(&root).expect("remove fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_measured_from_a_listing_counts_its_size_as_an_estimate() {
+        use crate::fsinfo::ListedFacts;
+
+        let listed = ListedFacts {
+            apparent_size: 26 * 1024 * 1024 * 1024,
+            is_dir: false,
+            is_sparse: false,
+            is_compressed: false,
+            is_reparse_point: false,
+            modified_unix_ms: None,
+        };
+        let entry = super::make_listed_entry("pagefile.sys", &listed);
+        assert_eq!(entry.kind, EntryKind::File);
+        assert_eq!(entry.size_bytes, 26 * 1024 * 1024 * 1024);
+        assert!(entry.allocation_estimated);
+        // The filesystem never said how many clusters it owns, so the length
+        // stands in for the allocation.
+        assert_eq!(entry.allocated_bytes, 26 * 1024 * 1024 * 1024);
+        assert_eq!(entry.file_id, None);
+
+        // A file that the listing says owns fewer clusters than its length is
+        // not counted at its length.
+        let sparse = ListedFacts {
+            is_sparse: true,
+            ..listed
+        };
+        let entry = super::make_listed_entry("hole.bin", &sparse);
+        assert_eq!(entry.allocated_bytes, 0);
+        assert!(entry.is_sparse);
     }
 
     #[cfg(windows)]

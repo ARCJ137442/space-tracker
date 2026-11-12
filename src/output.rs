@@ -137,8 +137,13 @@ pub fn print_entries(entries: &[Entry], root: &str, json: bool) -> Result<()> {
             (false, true) => " [sparse]",
             (false, false) => "",
         };
+        let estimate_note = if entry.allocation_estimated {
+            " [allocation estimated: file could not be opened]"
+        } else {
+            ""
+        };
         println!(
-            "{} | {} | alloc={} | free={} | shared={} | links={} | {}{}{}",
+            "{} | {} | alloc={} | free={} | shared={} | links={} | {}{}{}{}",
             match entry.kind {
                 crate::model::EntryKind::Directory => "dir",
                 crate::model::EntryKind::File => "file",
@@ -150,7 +155,8 @@ pub fn print_entries(entries: &[Entry], root: &str, json: bool) -> Result<()> {
             entry.link_count,
             path,
             link,
-            kind_note
+            kind_note,
+            estimate_note
         );
     }
     Ok(())
@@ -216,10 +222,21 @@ pub fn print_audit(report: &crate::audit::AuditReport, json: bool) -> Result<()>
         report.sparse_files,
         format_bytes(report.sparse_apparent_bytes)
     );
+    println!(
+        "measured from the directory listing (allocation estimated): {} files | {} of surface size",
+        report.estimated_files,
+        format_bytes(report.estimated_apparent_bytes)
+    );
     if !report.unreadable_directories.is_empty() {
         println!("unreadable paths:");
         for path in &report.unreadable_directories {
             println!("  {path}");
+        }
+    }
+    if !report.error_kinds.is_empty() {
+        println!("read failures by kind:");
+        for (message, count) in &report.error_kinds {
+            println!("  {count} | {message}");
         }
     }
     if !report.largest_shared_records.is_empty() {

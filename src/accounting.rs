@@ -263,6 +263,7 @@ mod tests {
             }),
             is_sparse: false,
             is_placeholder: false,
+            allocation_estimated: false,
         }
     }
 
@@ -282,6 +283,7 @@ mod tests {
             file_id: None,
             is_sparse: false,
             is_placeholder: false,
+            allocation_estimated: false,
         }
     }
 

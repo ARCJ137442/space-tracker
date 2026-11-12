@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +41,7 @@ impl Default for Entry {
             file_id: None,
             is_sparse: false,
             is_placeholder: false,
+            allocation_estimated: false,
         }
     }
 }
@@ -106,6 +107,11 @@ pub struct Entry {
     /// the filesystem recalls on access. It occupies no space on this volume.
     #[serde(default)]
     pub is_placeholder: bool,
+    /// The allocation of this entry is an estimate rather than a measurement:
+    /// the file could not be opened, so its size came from the directory
+    /// listing and the filesystem never reported how many clusters it owns.
+    #[serde(default)]
+    pub allocation_estimated: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

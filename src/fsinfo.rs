@@ -162,6 +162,98 @@ fn is_ascii_letter(value: u16) -> bool {
         || (value >= b'a' as u16 && value <= b'z' as u16)
 }
 
+/// What a directory listing says about one entry, without opening it.
+///
+/// Some files cannot be opened by anyone: the paging file and the hibernation
+/// file are locked by the system, and files inside protected folders refuse
+/// access. Their names are still listed, and the listing carries the apparent
+/// length, which is enough to keep them from vanishing from the measurement.
+#[derive(Clone, Copy, Debug)]
+pub struct ListedFacts {
+    /// Length of the file's contents, as the listing reports it.
+    pub apparent_size: u64,
+    pub is_dir: bool,
+    /// The file keeps its data in holes.
+    pub is_sparse: bool,
+    /// The file is stored compressed, so it owns fewer clusters than its
+    /// length.
+    pub is_compressed: bool,
+    /// The entry is a reparse point: a link, or a cloud placeholder whose
+    /// data lives elsewhere.
+    pub is_reparse_point: bool,
+    /// Last write time, in milliseconds since the Unix epoch.
+    pub modified_unix_ms: Option<i64>,
+}
+
+/// Looks one entry up in its parent's directory listing.
+///
+/// This is the fallback for files that cannot be opened: the listing gives
+/// the apparent length and the attributes, but not the cluster allocation,
+/// so the caller has to treat the allocation as an estimate.
+#[cfg(windows)]
+pub fn listed(path: &Path) -> Option<ListedFacts> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_SPARSE_FILE, FindClose, FindFirstFileW, FindNextFileW, WIN32_FIND_DATAW,
+    };
+    use std::os::windows::ffi::OsStrExt;
+
+    let name = path.file_name()?;
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let mut raw: Vec<u16> = parent.as_os_str().encode_wide().collect();
+    if raw.last() != Some(&(b'\\' as u16)) {
+        raw.push(b'\\' as u16);
+    }
+    raw.extend(name.encode_wide());
+    let pattern = extended_wide(raw);
+
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let handle = unsafe { FindFirstFileW(pattern.as_ptr(), &mut data) };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let wanted: Vec<u16> = name.encode_wide().collect();
+    let mut found = None;
+    loop {
+        if listed_name_equals(&data.cFileName, &wanted) {
+            let attributes = data.dwFileAttributes;
+            let written = ((data.ftLastWriteTime.dwHighDateTime as u64) << 32)
+                | data.ftLastWriteTime.dwLowDateTime as u64;
+            found = Some(ListedFacts {
+                apparent_size: ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64,
+                is_dir: attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                is_sparse: attributes & FILE_ATTRIBUTE_SPARSE_FILE != 0,
+                is_compressed: attributes & FILE_ATTRIBUTE_COMPRESSED != 0,
+                is_reparse_point: attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+                modified_unix_ms: windows_time_to_unix_ms(written as i64),
+            });
+            break;
+        }
+        let more = unsafe { FindNextFileW(handle, &mut data) };
+        if more == 0 {
+            break;
+        }
+    }
+    unsafe {
+        FindClose(handle);
+    }
+    found
+}
+
+/// Whether the listing entry carries exactly the name that was asked for.
+#[cfg(windows)]
+fn listed_name_equals(stored: &[u16], wanted: &[u16]) -> bool {
+    let stored: Vec<u16> = stored.iter().copied().take_while(|c| *c != 0).collect();
+    stored == wanted
+}
+
+#[cfg(not(windows))]
+pub fn listed(_path: &Path) -> Option<ListedFacts> {
+    None
+}
+
 /// Builds a NUL-terminated wide path that the Win32 file APIs accept,
 /// including paths longer than `MAX_PATH` and UNC shares.
 #[cfg(windows)]
@@ -174,7 +266,12 @@ fn wide_path(path: &Path) -> Vec<u16> {
             *character = b'\\' as u16;
         }
     }
+    extended_wide(raw)
+}
 
+/// Adds the `\\?\` prefix when the path needs it, and terminates the string.
+#[cfg(windows)]
+fn extended_wide(raw: Vec<u16>) -> Vec<u16> {
     const QUESTION: u16 = b'?' as u16;
     const BACKSLASH: u16 = b'\\' as u16;
     const COLON: u16 = b':' as u16;
@@ -219,4 +316,57 @@ pub fn read(path: &Path) -> io::Result<FileFacts> {
         is_sparse: false,
         is_placeholder: false,
     })
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{listed, read};
+    use std::fs;
+
+    #[test]
+    fn a_file_is_visible_in_the_directory_listing() {
+        let root = std::env::temp_dir().join(format!(
+            "space-tracker-listed-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create fixture");
+        let file = root.join("listed.bin");
+        fs::write(&file, vec![3u8; 8192]).expect("write file");
+
+        let facts = listed(&file).expect("listing");
+        assert_eq!(facts.apparent_size, 8192);
+        assert!(!facts.is_dir);
+        assert!(!facts.is_sparse);
+        assert!(!facts.is_compressed);
+        assert!(!facts.is_reparse_point);
+        assert!(facts.modified_unix_ms.is_some());
+
+        // A directory is listed as a directory.
+        let directory = listed(&root).expect("directory listing");
+        assert!(directory.is_dir);
+
+        // A path that is not there is not listed.
+        assert!(listed(&root.join("missing.bin")).is_none());
+
+        fs::remove_dir_all(&root).expect("remove fixture");
+    }
+
+    #[test]
+    fn reading_and_listing_agree_about_a_file() {
+        let root = std::env::temp_dir().join(format!(
+            "space-tracker-agree-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create fixture");
+        let file = root.join("agree.bin");
+        fs::write(&file, vec![5u8; 4096]).expect("write file");
+
+        let facts = read(&file).expect("read file");
+        let listed_facts = listed(&file).expect("listing");
+        assert_eq!(facts.apparent_size, listed_facts.apparent_size);
+
+        fs::remove_dir_all(&root).expect("remove fixture");
+    }
 }

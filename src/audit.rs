@@ -71,8 +71,14 @@ pub struct AuditReport {
     pub placeholder_apparent_bytes: u64,
     pub sparse_files: u64,
     pub sparse_apparent_bytes: u64,
+    /// Files that could not be opened, so their size came from the directory
+    /// listing and their allocation is an estimate.
+    pub estimated_files: u64,
+    pub estimated_apparent_bytes: u64,
     /// Directories the walk could not read.
     pub unreadable_directories: Vec<String>,
+    /// How many times each kind of read failure happened.
+    pub error_kinds: Vec<(String, u64)>,
     pub largest_shared_records: Vec<SharedRecord>,
     pub largest_files: Vec<LargestFile>,
     pub suspected_duplicates: Vec<SuspectedDuplicate>,
@@ -100,6 +106,8 @@ pub fn run(snapshot: &Snapshot) -> AuditReport {
     let mut placeholder_apparent_bytes = 0u64;
     let mut sparse_files = 0u64;
     let mut sparse_apparent_bytes = 0u64;
+    let mut estimated_files = 0u64;
+    let mut estimated_apparent_bytes = 0u64;
     // Files grouped by size and write time, to catch the same bytes counted
     // under two different record identities.
     let mut by_shape: HashMap<(u64, Option<i64>), Vec<String>> = HashMap::new();
@@ -117,6 +125,11 @@ pub fn run(snapshot: &Snapshot) -> AuditReport {
         } else if entry.is_sparse {
             sparse_files += 1;
             sparse_apparent_bytes = sparse_apparent_bytes.saturating_add(entry.size_bytes);
+        }
+        if entry.allocation_estimated {
+            estimated_files += 1;
+            estimated_apparent_bytes =
+                estimated_apparent_bytes.saturating_add(entry.size_bytes);
         }
         by_shape
             .entry((entry.size_bytes, entry.modified_unix_ms))
@@ -236,6 +249,13 @@ pub fn run(snapshot: &Snapshot) -> AuditReport {
     unreadable_directories.sort();
     unreadable_directories.truncate(LIST_LIMIT);
 
+    let mut error_kinds: HashMap<String, u64> = HashMap::new();
+    for error in snapshot.errors.iter() {
+        *error_kinds.entry(error.message.clone()).or_default() += 1;
+    }
+    let mut error_kinds: Vec<(String, u64)> = error_kinds.into_iter().collect();
+    error_kinds.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
     AuditReport {
         root: snapshot.root.clone(),
         snapshot_id: snapshot.snapshot_id.clone(),
@@ -254,7 +274,10 @@ pub fn run(snapshot: &Snapshot) -> AuditReport {
         placeholder_apparent_bytes,
         sparse_files,
         sparse_apparent_bytes,
+        estimated_files,
+        estimated_apparent_bytes,
         unreadable_directories,
+        error_kinds,
         largest_shared_records: largest_shared,
         largest_files,
         suspected_duplicates,
