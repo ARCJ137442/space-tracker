@@ -217,10 +217,17 @@ pub struct DeltaReport {
 
 pub fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
     if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()?.join(path))
+        return Ok(path.to_path_buf());
     }
+    // "C:" names the current directory of that drive, which is not what a
+    // scan root means. Treat a drive without a root as the drive's root.
+    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
+        return Ok(PathBuf::from(format!(
+            "{}\\",
+            prefix.as_os_str().to_string_lossy()
+        )));
+    }
+    Ok(std::env::current_dir()?.join(path))
 }
 
 pub fn root_key(path: &Path) -> String {
@@ -258,8 +265,8 @@ pub fn target_relative_path(snapshot: &Snapshot, requested: &Path) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
-    use super::{relative_key, root_key};
-    use std::path::Path;
+    use super::{absolute_path, relative_key, root_key};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn normalizes_root_case_and_trailing_separator() {
@@ -271,5 +278,18 @@ mod tests {
     fn normalizes_relative_paths_for_json() {
         assert_eq!(relative_key(Path::new("foo\\bar")), "foo/bar");
         assert_eq!(relative_key(Path::new(".")), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_drive_letter_means_the_drive_root() {
+        assert_eq!(
+            absolute_path(Path::new("C:")).expect("path"),
+            PathBuf::from("C:\\")
+        );
+        assert_eq!(
+            absolute_path(Path::new("C:\\Users")).expect("path"),
+            PathBuf::from("C:\\Users")
+        );
     }
 }
