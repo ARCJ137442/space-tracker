@@ -174,21 +174,16 @@ mod tests {
                     relative_path: "".to_string(),
                     kind: EntryKind::Directory,
                     size_bytes: size,
-                    modified_unix_ms: None,
-                    is_reparse_point: false,
-                    link_target: None,
-                    followed: false,
+                    ..Default::default()
                 },
                 Entry {
                     relative_path: "child".to_string(),
                     kind: EntryKind::Directory,
                     size_bytes: size,
-                    modified_unix_ms: None,
-                    is_reparse_point: false,
-                    link_target: None,
-                    followed: false,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         }
     }
 

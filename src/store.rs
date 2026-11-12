@@ -26,9 +26,18 @@ struct SnapshotRecord {
     snapshot_id: String,
     file_name: String,
     kind: SnapshotFileKind,
+    /// Snapshot format the payload was written in. A record written by an
+    /// older build is not comparable with a newer one field for field, so
+    /// the store starts a fresh base instead of layering deltas on it.
+    #[serde(default)]
+    format_version: u32,
     captured_at_unix_ms: u64,
     duration_ms: u64,
     total_bytes: u64,
+    #[serde(default)]
+    total_allocated_bytes: u64,
+    #[serde(default)]
+    total_reclaimable_bytes: u64,
     file_count: u64,
     directory_count: u64,
     reparse_point_count: u64,
@@ -52,6 +61,10 @@ struct DeltaSnapshot {
     captured_at_unix_ms: u64,
     duration_ms: u64,
     total_bytes: u64,
+    #[serde(default)]
+    total_allocated_bytes: u64,
+    #[serde(default)]
+    total_reclaimable_bytes: u64,
     file_count: u64,
     directory_count: u64,
     reparse_point_count: u64,
@@ -100,7 +113,9 @@ impl SnapshotStore {
     pub fn save(&self, snapshot: &mut Snapshot, _compact: bool) -> Result<PathBuf> {
         let previous = self.latest_for_root_key(&snapshot.root_key)?;
         let use_base = previous.as_ref().is_none_or(|stored| {
-            !is_new_format_path(&stored.path) || self.should_rebase(&snapshot.root_key)
+            !is_new_format_path(&stored.path)
+                || stored.snapshot.format_version != SNAPSHOT_FORMAT_VERSION
+                || self.should_rebase(&snapshot.root_key)
         });
         let kind = if use_base {
             SnapshotFileKind::Base
@@ -354,9 +369,12 @@ impl SnapshotStore {
                 .context("snapshot filename is not valid UTF-8")?
                 .to_string(),
             kind,
+            format_version: snapshot.format_version,
             captured_at_unix_ms: snapshot.captured_at_unix_ms,
             duration_ms: snapshot.duration_ms,
             total_bytes: snapshot.total_bytes,
+            total_allocated_bytes: snapshot.total_allocated_bytes,
+            total_reclaimable_bytes: snapshot.total_reclaimable_bytes,
             file_count: snapshot.file_count,
             directory_count: snapshot.directory_count,
             reparse_point_count: snapshot.reparse_point_count,
@@ -457,6 +475,8 @@ fn record_summary(record: &SnapshotRecord, root: &str) -> SnapshotSummary {
         captured_at_unix_ms: record.captured_at_unix_ms,
         duration_ms: record.duration_ms,
         total_bytes: record.total_bytes,
+        total_allocated_bytes: record.total_allocated_bytes,
+        total_reclaimable_bytes: record.total_reclaimable_bytes,
         file_count: record.file_count,
         directory_count: record.directory_count,
         reparse_point_count: record.reparse_point_count,
@@ -504,6 +524,8 @@ fn make_delta(previous: &Snapshot, current: &Snapshot) -> Result<DeltaSnapshot> 
         captured_at_unix_ms: current.captured_at_unix_ms,
         duration_ms: current.duration_ms,
         total_bytes: current.total_bytes,
+        total_allocated_bytes: current.total_allocated_bytes,
+        total_reclaimable_bytes: current.total_reclaimable_bytes,
         file_count: current.file_count,
         directory_count: current.directory_count,
         reparse_point_count: current.reparse_point_count,
@@ -562,6 +584,8 @@ fn apply_delta(snapshot: &mut Snapshot, delta: &DeltaSnapshot) -> Result<()> {
     snapshot.captured_at_unix_ms = delta.captured_at_unix_ms;
     snapshot.duration_ms = delta.duration_ms;
     snapshot.total_bytes = delta.total_bytes;
+    snapshot.total_allocated_bytes = delta.total_allocated_bytes;
+    snapshot.total_reclaimable_bytes = delta.total_reclaimable_bytes;
     snapshot.file_count = delta.file_count;
     snapshot.directory_count = delta.directory_count;
     snapshot.reparse_point_count = delta.reparse_point_count;
@@ -671,21 +695,16 @@ mod tests {
                     relative_path: String::new(),
                     kind: EntryKind::Directory,
                     size_bytes: child_size,
-                    modified_unix_ms: None,
-                    is_reparse_point: false,
-                    link_target: None,
-                    followed: false,
+                    ..Default::default()
                 },
                 Entry {
                     relative_path: "child".to_string(),
                     kind: EntryKind::File,
                     size_bytes: child_size,
-                    modified_unix_ms: None,
-                    is_reparse_point: false,
-                    link_target: None,
-                    followed: false,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         }
     }
 

@@ -1,4 +1,7 @@
+mod accounting;
+mod audit;
 mod delta;
+mod fsinfo;
 mod interactive;
 mod model;
 mod output;
@@ -91,6 +94,30 @@ enum Commands {
         json: bool,
     },
     Links {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
+        #[arg(long, default_value = ".space-tracker")]
+        store: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reports what deleting one path would really give back to the volume.
+    Reclaim {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, default_value = ".space-tracker")]
+        store: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Checks how the bytes in a snapshot were counted.
+    Audit {
         #[arg(long)]
         root: Option<PathBuf>,
         #[arg(long)]
@@ -205,6 +232,25 @@ fn run() -> Result<()> {
             store,
             json,
         } => run_links(root.as_deref(), snapshot.as_deref(), &store, json),
+        Commands::Reclaim {
+            root,
+            snapshot,
+            path,
+            store,
+            json,
+        } => run_reclaim(
+            root.as_deref(),
+            snapshot.as_deref(),
+            &path,
+            &store,
+            json,
+        ),
+        Commands::Audit {
+            root,
+            snapshot,
+            store,
+            json,
+        } => run_audit(root.as_deref(), snapshot.as_deref(), &store, json),
     }
 }
 
@@ -310,6 +356,58 @@ fn run_links(
         .cloned()
         .collect::<Vec<_>>();
     output::print_entries(&entries, &snapshot.root, json)
+}
+
+fn run_reclaim(
+    root: Option<&Path>,
+    snapshot_path: Option<&Path>,
+    requested_path: &Path,
+    store_path: &Path,
+    json: bool,
+) -> Result<()> {
+    let snapshot = load_snapshot(root, snapshot_path, store_path)?;
+    let relative = target_relative_path(&snapshot, requested_path)?;
+    let entry = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.relative_path == relative)
+        .context(format!(
+            "path is not in the snapshot: {}",
+            requested_path.display()
+        ))?;
+    let path = if relative.is_empty() {
+        snapshot.root.clone()
+    } else {
+        format!(
+            "{}\\{}",
+            snapshot.root.trim_end_matches(['\\', '/']),
+            relative.replace('/', "\\")
+        )
+    };
+    let report = model::ReclaimReport {
+        root: snapshot.root.clone(),
+        relative_path: relative,
+        path,
+        snapshot_id: snapshot.snapshot_id.clone(),
+        captured_at_unix_ms: snapshot.captured_at_unix_ms,
+        apparent_bytes: entry.size_bytes,
+        allocated_bytes: entry.allocated_bytes,
+        reclaimable_bytes: entry.reclaimable_bytes,
+        shared_bytes: entry.shared_bytes,
+        link_count: entry.link_count,
+    };
+    output::print_reclaim(&report, json)
+}
+
+fn run_audit(
+    root: Option<&Path>,
+    snapshot_path: Option<&Path>,
+    store_path: &Path,
+    json: bool,
+) -> Result<()> {
+    let snapshot = load_snapshot(root, snapshot_path, store_path)?;
+    let report = audit::run(&snapshot);
+    output::print_audit(&report, json)
 }
 
 fn load_snapshot(

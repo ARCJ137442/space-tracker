@@ -4,6 +4,7 @@ use std::fs::{self, Metadata};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::fsinfo::{self, FileFacts};
 use crate::model::{
     Entry, EntryKind, SNAPSHOT_FORMAT_VERSION, ScanError, Snapshot, absolute_path, root_key,
 };
@@ -53,10 +54,10 @@ pub fn scan(root: &Path) -> Result<Snapshot> {
 /// so Agent-oriented scans do not pay for a second traversal.
 pub fn estimate(root: &Path) -> Result<ScanEstimate> {
     let root = absolute_path(root).context("failed to resolve scan root")?;
-    let root_metadata = fs::symlink_metadata(&root)
+    let root_facts = fsinfo::read(&root)
         .with_context(|| format!("cannot inspect scan root: {}", root.display()))?;
-    let root_is_reparse = is_reparse_point(&root_metadata);
-    if !root_metadata.is_dir() && !root_is_reparse {
+    let root_is_reparse = root_facts.is_reparse_point;
+    if !root_facts.is_dir && !root_is_reparse {
         bail!("scan root is not a directory: {}", root.display());
     }
 
@@ -86,10 +87,10 @@ fn scan_internal(
     progress: Option<Box<dyn FnMut(ScanProgress) + Send>>,
 ) -> Result<Snapshot> {
     let root = absolute_path(root).context("failed to resolve scan root")?;
-    let root_metadata = fs::symlink_metadata(&root)
+    let root_facts = fsinfo::read(&root)
         .with_context(|| format!("cannot inspect scan root: {}", root.display()))?;
-    let root_is_reparse = is_reparse_point(&root_metadata);
-    if !root_metadata.is_dir() && !root_is_reparse {
+    let root_is_reparse = root_facts.is_reparse_point;
+    if !root_facts.is_dir && !root_is_reparse {
         bail!("scan root is not a directory: {}", root.display());
     }
 
@@ -114,7 +115,7 @@ fn scan_internal(
             "",
             EntryKind::Directory,
             0,
-            &root_metadata,
+            &root_facts,
             resolve_link_target(&root),
         ));
         0
@@ -128,11 +129,16 @@ fn scan_internal(
         };
         state
             .entries
-            .push(make_entry("", EntryKind::Directory, total, &root_metadata));
+            .push(make_entry("", EntryKind::Directory, total, &root_facts));
         total
     };
     state.total_bytes = total_bytes;
     state.report(&root);
+
+    // The tree is walked in parallel and the order of the walk is not fixed,
+    // so the numbers that must not depend on it are settled here, once, over
+    // the finished tree.
+    let totals = crate::accounting::apply(&mut state.entries);
 
     Ok(Snapshot {
         format_version: SNAPSHOT_FORMAT_VERSION,
@@ -142,6 +148,8 @@ fn scan_internal(
         captured_at_unix_ms,
         duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         total_bytes,
+        total_allocated_bytes: totals.allocated_bytes,
+        total_reclaimable_bytes: totals.reclaimable_bytes,
         file_count: state.file_count,
         directory_count: state.directory_count,
         reparse_point_count: state.reparse_point_count,
@@ -228,17 +236,17 @@ fn scan_directory_parallel(path: &Path, relative: &str, state: &mut ScanState) -
 }
 
 fn scan_child_parallel(path: &Path, relative: &str, state: &mut ScanState) -> u64 {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let facts = match fsinfo::read(path) {
+        Ok(facts) => facts,
         Err(error) => {
             record_error(state, path, error);
             return 0;
         }
     };
 
-    if is_reparse_point(&metadata) {
+    if facts.is_reparse_point {
         let target = resolve_link_target(path);
-        let kind = if is_directory_link(&metadata, target.as_deref()) {
+        let kind = if is_directory_link(facts.is_dir, target.as_deref()) {
             EntryKind::Directory
         } else {
             EntryKind::File
@@ -250,26 +258,26 @@ fn scan_child_parallel(path: &Path, relative: &str, state: &mut ScanState) -> u6
         }
         state
             .entries
-            .push(make_entry_with_target(relative, kind, 0, &metadata, target));
+            .push(make_entry_with_target(relative, kind, 0, &facts, target));
         return 0;
     }
 
-    if metadata.is_dir() {
+    if facts.is_dir {
         state.directory_count += 1;
         let child_size = scan_directory_parallel(path, relative, state);
         state.entries.push(make_entry(
             relative,
             EntryKind::Directory,
             child_size,
-            &metadata,
+            &facts,
         ));
         child_size
     } else {
-        let size = metadata.len();
+        let size = facts.apparent_size;
         state.file_count += 1;
         state
             .entries
-            .push(make_entry(relative, EntryKind::File, size, &metadata));
+            .push(make_entry(relative, EntryKind::File, size, &facts));
         state.total_bytes = state.total_bytes.saturating_add(size);
         size
     }
@@ -296,8 +304,8 @@ fn build_scan_thread_pool() -> Result<rayon::ThreadPool> {
 }
 
 fn scan_child(path: &Path, relative: &str, state: &mut ScanState) -> u64 {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let facts = match fsinfo::read(path) {
+        Ok(facts) => facts,
         Err(error) => {
             record_error(state, path, error);
             state.report_if_due(path);
@@ -305,9 +313,9 @@ fn scan_child(path: &Path, relative: &str, state: &mut ScanState) -> u64 {
         }
     };
 
-    if is_reparse_point(&metadata) {
+    if facts.is_reparse_point {
         let target = resolve_link_target(path);
-        let kind = if is_directory_link(&metadata, target.as_deref()) {
+        let kind = if is_directory_link(facts.is_dir, target.as_deref()) {
             EntryKind::Directory
         } else {
             EntryKind::File
@@ -319,27 +327,27 @@ fn scan_child(path: &Path, relative: &str, state: &mut ScanState) -> u64 {
         }
         state
             .entries
-            .push(make_entry_with_target(relative, kind, 0, &metadata, target));
+            .push(make_entry_with_target(relative, kind, 0, &facts, target));
         state.report_if_due(path);
         return 0;
     }
 
-    let size = if metadata.is_dir() {
+    let size = if facts.is_dir {
         state.directory_count += 1;
         let child_size = scan_directory(path, relative, state);
         state.entries.push(make_entry(
             relative,
             EntryKind::Directory,
             child_size,
-            &metadata,
+            &facts,
         ));
         child_size
     } else {
-        let size = metadata.len();
+        let size = facts.apparent_size;
         state.file_count += 1;
         state
             .entries
-            .push(make_entry(relative, EntryKind::File, size, &metadata));
+            .push(make_entry(relative, EntryKind::File, size, &facts));
         state.total_bytes = state.total_bytes.saturating_add(size);
         size
     };
@@ -428,7 +436,7 @@ fn estimate_child(path: &Path, estimate: &mut ScanEstimate) {
     estimate.total_entries = estimate.total_entries.saturating_add(1);
     if is_reparse_point(&metadata) {
         let target = resolve_link_target(path);
-        if is_directory_link(&metadata, target.as_deref()) {
+        if is_directory_link(metadata.is_dir(), target.as_deref()) {
             estimate.directory_count = estimate.directory_count.saturating_add(1);
         } else {
             estimate.file_count = estimate.file_count.saturating_add(1);
@@ -499,15 +507,25 @@ impl ScanState {
     }
 }
 
-fn make_entry(relative: &str, kind: EntryKind, size_bytes: u64, metadata: &Metadata) -> Entry {
+fn make_entry(relative: &str, kind: EntryKind, size_bytes: u64, facts: &FileFacts) -> Entry {
+    let is_file = kind == EntryKind::File;
     Entry {
         relative_path: relative.to_string(),
         kind,
         size_bytes,
-        modified_unix_ms: modified_unix_ms(metadata),
+        modified_unix_ms: facts.modified_unix_ms,
         is_reparse_point: false,
         link_target: None,
         followed: false,
+        // A directory's allocation is settled by the accounting pass, which
+        // knows which of the file records below it belong to it.
+        allocated_bytes: if is_file { facts.allocated_size } else { 0 },
+        reclaimable_bytes: 0,
+        shared_bytes: 0,
+        link_count: if is_file { facts.link_count } else { 0 },
+        file_id: if is_file { facts.file_id } else { None },
+        is_sparse: if is_file { facts.is_sparse } else { false },
+        is_placeholder: if is_file { facts.is_placeholder } else { false },
     }
 }
 
@@ -515,22 +533,31 @@ fn make_entry_with_target(
     relative: &str,
     kind: EntryKind,
     size_bytes: u64,
-    metadata: &Metadata,
+    facts: &FileFacts,
     link_target: Option<String>,
 ) -> Entry {
     Entry {
         relative_path: relative.to_string(),
         kind,
         size_bytes,
-        modified_unix_ms: modified_unix_ms(metadata),
+        modified_unix_ms: facts.modified_unix_ms,
         is_reparse_point: true,
         link_target,
         followed: false,
+        // A reparse point stands for something else. Its own record is not
+        // counted, and the target behind it is not walked into.
+        allocated_bytes: 0,
+        reclaimable_bytes: 0,
+        shared_bytes: 0,
+        link_count: 0,
+        file_id: None,
+        is_sparse: false,
+        is_placeholder: false,
     }
 }
 
-fn is_directory_link(metadata: &Metadata, target: Option<&str>) -> bool {
-    if metadata.is_dir() {
+fn is_directory_link(is_dir: bool, target: Option<&str>) -> bool {
+    if is_dir {
         return true;
     }
     target
@@ -543,14 +570,6 @@ fn resolve_link_target(path: &Path) -> Option<String> {
     fs::canonicalize(path)
         .ok()
         .map(|target| path_string(&target))
-}
-
-fn modified_unix_ms(metadata: &Metadata) -> Option<i64> {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
 }
 
 fn record_error(state: &mut ScanState, path: &Path, error: impl std::fmt::Display) {
@@ -689,8 +708,118 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn hard_linked_file_is_counted_once_and_frees_nothing_on_its_own() {
+        let root = test_root_named("hardlink");
+        fs::create_dir_all(&root).expect("create fixture");
+        let target = root.join("target.bin");
+        let alias = root.join("alias.bin");
+        fs::write(&target, vec![7u8; 8192]).expect("write target");
+
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/H"])
+            .arg(&alias)
+            .arg(&target)
+            .status()
+            .expect("run mklink");
+        if !status.success() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let snapshot = scan(&root).expect("scan fixture");
+        assert_eq!(snapshot.file_count, 2);
+        // The surface size counts the bytes through both names.
+        assert_eq!(snapshot.total_bytes, 16_384);
+        // The volume holds one record of 8192 bytes.
+        assert_eq!(snapshot.total_allocated_bytes, 8192);
+        // Deleting one of the names frees nothing: the record survives.
+        assert_eq!(snapshot.total_reclaimable_bytes, 8192);
+
+        let find = |path: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.relative_path == path)
+                .expect("entry")
+        };
+        let root_entry = find("");
+        assert_eq!(root_entry.allocated_bytes, 8192);
+        // Both links sit in the same folder, so that folder holds the whole
+        // record and deleting it gives the bytes back.
+        assert_eq!(root_entry.reclaimable_bytes, 8192);
+        assert_eq!(root_entry.shared_bytes, 8192);
+        // Removing a single name frees nothing.
+        assert_eq!(find("alias.bin").reclaimable_bytes, 0);
+        assert_eq!(find("target.bin").reclaimable_bytes, 0);
+
+        // Both names report the same record and the same link count.
+        assert_eq!(find("alias.bin").file_id, find("target.bin").file_id);
+        assert_eq!(find("alias.bin").link_count, 2);
+        assert_eq!(find("target.bin").link_count, 2);
+        assert_ne!(find("alias.bin").file_id, None);
+
+        fs::remove_dir_all(&root).expect("remove fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sparse_file_reports_no_allocation_instead_of_its_logical_size() {
+        let root = test_root_named("sparse");
+        fs::create_dir_all(&root).expect("create fixture");
+        let file = root.join("hole.bin");
+        fs::File::create(&file).expect("create file");
+
+        let status = Command::new("cmd")
+            .args(["/C", "fsutil", "sparse", "setflag"])
+            .arg(&file)
+            .status()
+            .expect("run fsutil");
+        if !status.success() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        // Growing a sparse file leaves a hole: the logical size grows, the
+        // space the file owns does not.
+        let handle = fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open sparse file");
+        handle.set_len(1024 * 1024 * 1024).expect("grow sparse file");
+        drop(handle);
+
+        let snapshot = scan(&root).expect("scan fixture");
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == "hole.bin")
+            .expect("file entry");
+
+        assert_eq!(entry.size_bytes, 1024 * 1024 * 1024);
+        assert!(entry.is_sparse);
+        // The hole occupies nothing, so the volume gives up nothing for it.
+        assert_eq!(entry.allocated_bytes, 0);
+        assert_eq!(snapshot.total_allocated_bytes, 0);
+        assert_eq!(snapshot.total_reclaimable_bytes, 0);
+
+        fs::remove_dir_all(&root).expect("remove fixture");
+    }
+
+    #[cfg(windows)]
     fn test_root() -> PathBuf {
         let root = std::env::temp_dir().join(format!("space-tracker-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    /// Tests run in parallel and share one process, so every fixture needs
+    /// its own directory.
+    #[cfg(windows)]
+    fn test_root_named(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "space-tracker-{tag}-test-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         root
     }

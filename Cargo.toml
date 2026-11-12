@@ -1,6 +1,6 @@
 [package]
 name = "space_tracker"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Read-only Windows disk snapshot and growth tracker"
 license = "MIT"
@@ -14,4 +14,10 @@ rayon = "1.10"
 zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }

@@ -2,7 +2,8 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::model::{
-    DeltaItem, DeltaReport, Entry, Snapshot, SnapshotSummary, StoredSnapshotSummary,
+    DeltaItem, DeltaReport, Entry, ReclaimReport, Snapshot, SnapshotSummary,
+    StoredSnapshotSummary,
 };
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -40,6 +41,11 @@ pub fn print_scan(snapshot_path: &str, snapshot: &Snapshot, json: bool) -> Resul
 pub fn print_summary(snapshot: &Snapshot) {
     println!("root: {}", snapshot.root);
     println!("size: {}", format_bytes(snapshot.total_bytes));
+    println!("allocated: {}", format_bytes(snapshot.total_allocated_bytes));
+    println!(
+        "reclaimable: {}",
+        format_bytes(snapshot.total_reclaimable_bytes)
+    );
     println!("files: {}", snapshot.file_count);
     println!("directories: {}", snapshot.directory_count);
     println!(
@@ -126,16 +132,130 @@ pub fn print_entries(entries: &[Entry], root: &str, json: bool) -> Result<()> {
             .as_deref()
             .map(|target| format!(" -> {target}"))
             .unwrap_or_default();
+        let kind_note = match (entry.is_placeholder, entry.is_sparse) {
+            (true, _) => " [placeholder: data lives elsewhere]",
+            (false, true) => " [sparse]",
+            (false, false) => "",
+        };
         println!(
-            "{} | {} | {}{}",
+            "{} | {} | alloc={} | free={} | shared={} | links={} | {}{}{}",
             match entry.kind {
                 crate::model::EntryKind::Directory => "dir",
                 crate::model::EntryKind::File => "file",
             },
             format_bytes(entry.size_bytes),
+            format_bytes(entry.allocated_bytes),
+            format_bytes(entry.reclaimable_bytes),
+            format_bytes(entry.shared_bytes),
+            entry.link_count,
             path,
-            link
+            link,
+            kind_note
         );
+    }
+    Ok(())
+}
+
+pub fn print_reclaim(report: &ReclaimReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(report);
+    }
+    println!("path: {}", report.path);
+    println!("apparent: {}", format_bytes(report.apparent_bytes));
+    println!("allocated: {}", format_bytes(report.allocated_bytes));
+    println!("reclaimable: {}", format_bytes(report.reclaimable_bytes));
+    println!("shared: {}", format_bytes(report.shared_bytes));
+    if report.link_count > 0 {
+        println!("hard links: {}", report.link_count);
+    }
+    println!("snapshot: {}", report.snapshot_id);
+    Ok(())
+}
+
+pub fn print_audit(report: &crate::audit::AuditReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(report);
+    }
+    println!("root: {}", report.root);
+    println!("snapshot: {}", report.snapshot_id);
+    println!("files: {}", report.file_count);
+    println!("distinct records: {}", report.distinct_records);
+    println!("files without identity: {}", report.files_without_identity);
+    println!("records under several paths: {}", report.records_with_multiple_paths);
+    println!(
+        "apparent (all paths): {}",
+        format_bytes(report.apparent_bytes_all_paths)
+    );
+    println!(
+        "apparent (one per record): {}",
+        format_bytes(report.apparent_bytes_distinct_records)
+    );
+    println!(
+        "allocated (one per record): {}",
+        format_bytes(report.allocated_bytes_distinct_records)
+    );
+    println!(
+        "allocated (single-link records): {}",
+        format_bytes(report.allocated_bytes_single_link_records)
+    );
+    println!("link count histogram:");
+    for (links, count) in &report.link_count_histogram {
+        println!("  {links} links | {count} files");
+    }
+    println!("volume serials seen:");
+    for (serial, count) in &report.volume_serials {
+        println!("  {serial} | {count} files");
+    }
+    println!(
+        "placeholders (data not on this volume): {} files | {} of surface size",
+        report.placeholder_files,
+        format_bytes(report.placeholder_apparent_bytes)
+    );
+    println!(
+        "sparse files: {} files | {} of surface size",
+        report.sparse_files,
+        format_bytes(report.sparse_apparent_bytes)
+    );
+    if !report.unreadable_directories.is_empty() {
+        println!("unreadable paths:");
+        for path in &report.unreadable_directories {
+            println!("  {path}");
+        }
+    }
+    if !report.largest_shared_records.is_empty() {
+        println!("largest records under several paths:");
+        for record in &report.largest_shared_records {
+            println!(
+                "  {} | {} paths | links={} | {}",
+                format_bytes(record.allocated_bytes),
+                record.paths,
+                record.link_count,
+                record.sample_paths.join(" | ")
+            );
+        }
+    }
+    if !report.largest_files.is_empty() {
+        println!("largest files:");
+        for file in &report.largest_files {
+            println!(
+                "  {} | apparent {} | links={} | {}",
+                format_bytes(file.allocated_bytes),
+                format_bytes(file.apparent_bytes),
+                file.link_count,
+                file.relative_path
+            );
+        }
+    }
+    if !report.suspected_duplicates.is_empty() {
+        println!("suspected duplicates (same size and write time, different records):");
+        for duplicate in &report.suspected_duplicates {
+            println!(
+                "  {} copies | {} | {}",
+                duplicate.copies,
+                format_bytes(duplicate.size_bytes),
+                duplicate.sample_paths.join(" | ")
+            );
+        }
     }
     Ok(())
 }
